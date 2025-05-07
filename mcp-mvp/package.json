@@ -15,7 +15,10 @@
     "copy-web": "xcopy src\\web build\\web /E /I /Y",
     "prepare": "npm run build",
     "watch": "tsc --watch",
-    "inspector": "npx @modelcontextprotocol/inspector build/index.js"
+    "inspector": "npx @modelcontextprotocol/inspector build/index.js",
+    "test:dynamic-tools": "ts-node src/client/testDynamicTools.ts",
+    "tools:metrics": "curl http://localhost:3333/tools/metrics",
+    "tools:reset-metrics": "curl -X POST http://localhost:3333/tools/metrics/reset"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.40.1",
@@ -33,6 +36,7 @@
     "@types/express": "^5.0.1",
     "@types/node": "^20.11.24",
     "@types/uuid": "^9.0.8",
+    "ts-node": "^10.9.2",
     "typescript": "^5.3.3"
   }
 }

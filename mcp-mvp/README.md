@@ -15,6 +15,7 @@ This project implements a local Model Context Protocol (MCP) server that can be 
 - Web interface for interacting with models
 - Note creation and listing
 - Jira issue retrieval
+- Dynamic tool discovery for reduced token usage
 
 ## Setup
 
@@ -82,6 +83,47 @@ The web interface provides:
 | Claude 3 Opus | claude-3-opus-20240229 | anthropic.claude-3-opus-20240229-v1:0 |
 | Claude 3 Sonnet | claude-3-sonnet-20240229 | anthropic.claude-3-sonnet-20240229-v1:0 |
 | Claude 3 Haiku | claude-3-haiku-20240307 | anthropic.claude-3-haiku-20240307-v1:0 |
+
+## Dynamic Tool Discovery
+
+The server includes a new dynamic tool discovery feature to reduce token usage when working with large tool sets:
+
+### Using Dynamic Tools
+
+1. **API Endpoints**:
+   - GET `/tools` - Fetches tools based on context
+   - GET `/tools/metrics` - View token usage metrics
+   - POST `/tools/metrics/reset` - Reset metrics
+
+2. **Query Parameters**:
+   - `context` - The current conversation context (e.g., "email", "finance")
+   - `category` - Tool category (e.g., "communication", "search")
+   - `userId` - User identifier for personalized access
+
+3. **Client Library**:
+   ```typescript
+   import { DynamicToolClient } from './client/dynamicTools.js';
+   
+   // Create a dynamic tools client
+   const dynamicClient = new DynamicToolClient(mcpClient);
+   
+   // Get tools with context
+   const emailTools = await dynamicClient.getTools({ context: 'email' });
+   ```
+
+4. **Testing**:
+   ```bash
+   # Run the TypeScript test
+   npm run test:dynamic-tools
+   
+   # View metrics
+   npm run tools:metrics
+   
+   # Reset metrics
+   npm run tools:reset-metrics
+   ```
+
+For more details on the implementation and roadmap, see the [Dynamic Tools Documentation](docs/dynamicTools.md).
 
 ## Troubleshooting
 

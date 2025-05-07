@@ -49,6 +49,8 @@ import { BedrockRuntimeClient, InvokeModelCommand } from "@aws-sdk/client-bedroc
 import dotenv from "dotenv";
 import fetch from 'node-fetch';
 import { callClaudeDirectAPI, handleToolExecution, convertMcpToolsToAnthropicFormat, formatMessagesForAnthropic } from './anthropicClient.js';
+import crypto from 'crypto';
+import { DynamicToolClient, extractContextFromMessage } from './client/dynamicTools.js';
 dotenv.config();
 
 /**
@@ -345,6 +347,84 @@ app.use(express.json());
 
 const bedrock = new BedrockRuntimeClient({ region: process.env.AWS_REGION });
 
+// Add tool metrics tracking object
+const toolMetrics = {
+  baseline: {
+    requestCount: 0,
+    totalTokens: 0,
+    timeStamp: Date.now()
+  },
+  filtered: {
+    requestCount: 0,
+    totalTokens: 0,
+    timeStamp: Date.now()
+  },
+  // Rough estimate of tokens for a tool definition
+  estimateTokenCount: (tools: any[]): number => {
+    let count = 0;
+    for (const tool of tools) {
+      // Approximate calculation: name + description + schema properties
+      const nameTokens = tool.name.length / 4;
+      const descTokens = (tool.description?.length || 0) / 4;
+      const schemaTokens = JSON.stringify(tool.inputSchema || {}).length / 4;
+      count += nameTokens + descTokens + schemaTokens;
+    }
+    return Math.ceil(count);
+  },
+  // Track the tokens used for tools in a request
+  trackToolTokens: (tools: any[], phase: 'baseline' | 'filtered'): void => {
+    const tokenEstimate = toolMetrics.estimateTokenCount(tools);
+    toolMetrics[phase].requestCount++;
+    toolMetrics[phase].totalTokens += tokenEstimate;
+  },
+  // Get current metrics report
+  getMetricsReport: (): any => {
+    const baseline = toolMetrics.baseline;
+    const filtered = toolMetrics.filtered;
+    
+    const baselineAvg = baseline.requestCount > 0 
+      ? Math.round(baseline.totalTokens / baseline.requestCount) 
+      : 0;
+      
+    const filteredAvg = filtered.requestCount > 0 
+      ? Math.round(filtered.totalTokens / filtered.requestCount) 
+      : 0;
+      
+    const reduction = baselineAvg > 0 && filteredAvg > 0
+      ? Math.round(((baselineAvg - filteredAvg) / baselineAvg) * 100)
+      : 0;
+      
+    return {
+      baseline: {
+        requests: baseline.requestCount,
+        totalTokens: baseline.totalTokens,
+        avgTokensPerRequest: baselineAvg,
+        since: new Date(baseline.timeStamp).toISOString()
+      },
+      filtered: {
+        requests: filtered.requestCount,
+        totalTokens: filtered.totalTokens,
+        avgTokensPerRequest: filteredAvg,
+        since: new Date(filtered.timeStamp).toISOString()
+      },
+      reduction: `${reduction}%`
+    };
+  },
+  // Reset metrics
+  resetMetrics: (): void => {
+    toolMetrics.baseline = {
+      requestCount: 0,
+      totalTokens: 0,
+      timeStamp: Date.now()
+    };
+    toolMetrics.filtered = {
+      requestCount: 0,
+      totalTokens: 0,
+      timeStamp: Date.now()
+    };
+  }
+};
+
 async function callClaudeHaiku(messages: any[], tools: any[], sessionIdentifier: string) {
   const body = {
     anthropic_version: "bedrock-2023-05-31",
@@ -380,14 +460,49 @@ app.post('/chat', async (req: Request, res: Response) => {
       await mcpClient.connect(transport);
       console.error('[LOG][CHAT] MCP client connected');
     }
-    // Fetch tools from MCP server and format for Bedrock Claude
-    const mcpTools = await mcpClient.listTools();
-    console.error('[LOG][CHAT] MCP tools listed:', mcpTools.tools);
+    
+    // Create dynamic tool client if not already created
+    let dynamicToolClient = new DynamicToolClient(mcpClient);
+    
+    // Always use context detection for tool loading (requirements #1 and #2)
+    // Extract context from user input and fetch relevant tools
+    console.error('[LOG][CHAT] Analyzing user input for context detection...');
+    const contexts = extractContextFromMessage(userInput);
+    
+    let mcpTools;
+    if (contexts.length > 0) {
+      // Context detected, load respective tools
+      console.error(`[LOG][CHAT] Context detected: ${contexts.join(', ')}`);
+      mcpTools = await dynamicToolClient.getToolsFromMessage(userInput);
+      console.error(`[LOG][CHAT] Loaded ${mcpTools.tools.length} tools for detected context`);
+    } else {
+      // No context detected, use empty tools array
+      console.error('[LOG][CHAT] No context detected, using empty tools array');
+      mcpTools = { 
+        tools: [],
+        metadata: {
+          timestamp: new Date().toISOString(),
+          requestId: crypto.randomUUID().toString(),
+          filtered: false,
+          originalCount: 0,
+          returnedCount: 0,
+          reductionPercent: 0,
+          reason: 'no_context_detected'
+        }
+      };
+    }
+    
+    // Format tools for Bedrock Claude
     const toolsClaude = mcpTools.tools.map((tool: any) => ({
       name: tool.name,
       description: tool.description || `MCP tool: ${tool.name}`,
       input_schema: tool.inputSchema
     }));
+    
+    // Track tokens for metrics
+    if (mcpTools.tools.length > 0) {
+      toolMetrics.trackToolTokens(mcpTools.tools, 'filtered');
+    }
     
     if (selectedModel === 'openai') {
       // OpenAI flow (using assistant and thread)
@@ -521,6 +636,25 @@ app.post('/chat', async (req: Request, res: Response) => {
         while (isToolCallPending && recursionCount < MAX_RECURSIONS) {
           console.error(`[LOG][ANTHROPIC] Processing turn ${recursionCount + 1}, message history length: ${messageHistory.length}`);
           
+          // Log context analysis results if filtering is enabled
+          if (process.env.ENABLE_CONTEXT_FILTERING === 'true') {
+            const lastUserMessage = messageHistory
+              .filter(msg => msg.role === 'user')
+              .pop();
+            
+            if (lastUserMessage && Array.isArray(lastUserMessage.content)) {
+              const textContent = lastUserMessage.content
+                .filter(content => content.type === 'text')
+                .map(content => content.text)
+                .join(' ');
+              
+              if (textContent) {
+                const contexts = extractContextFromMessage(textContent);
+                console.error(`[LOG][CONTEXT] Extracted contexts: ${contexts.join(', ') || 'none'}`);
+              }
+            }
+          }
+          
           // Call Anthropic API with session identifier
           const claudeResponse = await callClaudeDirectAPI(messageHistory, anthropicTools, sessionIdentifier);
           
@@ -596,6 +730,200 @@ app.post('/chat', async (req: Request, res: Response) => {
     console.error('[Server] Unhandled error in /chat:', err);
     res.status(500).json({ error: err.message });
   }
+});
+
+// Add new endpoint for dynamic tool discovery
+app.get('/tools', (req: Request, res: Response) => {
+  try {
+    // Extract query parameters (for future filtering)
+    const context = req.query.context as string | undefined;
+    const category = req.query.category as string | undefined;
+    const userId = req.query.userId as string | undefined;
+    
+    // Log the request
+    console.error(`[LOG][TOOLS] Tool discovery request received: context=${context}, category=${category}, userId=${userId}`);
+    
+    // If no context detected, return empty tools array (requirement #1)
+    if (!context) {
+      console.error('[LOG][TOOLS] No context detected, returning empty tools array');
+      res.json({
+        tools: [],
+        metadata: {
+          timestamp: new Date().toISOString(),
+          requestId: crypto.randomUUID(),
+          filtered: false,
+          originalCount: 0,
+          returnedCount: 0,
+          reductionPercent: 0,
+          reason: 'no_context_detected'
+        }
+      });
+      return;
+    }
+    
+    // Get all tools from the MCP server
+    // Since the McpServer API doesn't have a public way to directly access all tools,
+    // we'll build the list from the available tool names in the server.
+    const allTools: any[] = [];
+    
+    // Get all tools registered with the server by name and construct tool objects
+    const toolNames = [
+      'create_note',
+      'get_jira_issue',
+      'get_detailed_jira_issue',
+      'get_jira_issue_comments',
+      'get_jira_issue_transitions',
+      'search_jira_issues',
+      'get_jira_issue_watchers',
+      'get_jira_issue_attachments',
+      'get_jira_issue_sprints'
+    ];
+    
+    // Add tool categories and contexts for filtering in Phase 2
+    const toolMetadata: Record<string, { description: string, contexts: string[], categories: string[] }> = {
+      'create_note': {
+        description: 'Create a new note with title and content',
+        contexts: ['notes', 'writing', 'document', 'text'],
+        categories: ['creation', 'notes']
+      },
+      'get_jira_issue': {
+        description: 'Get basic information about a Jira issue',
+        contexts: ['jira', 'tickets', 'project management', 'issue tracking'],
+        categories: ['jira', 'retrieval']
+      },
+      'get_detailed_jira_issue': {
+        description: 'Get detailed information about a Jira issue',
+        contexts: ['jira', 'tickets', 'project management', 'issue tracking', 'details'],
+        categories: ['jira', 'retrieval', 'details']
+      },
+      'get_jira_issue_comments': {
+        description: 'Get comments from a Jira issue',
+        contexts: ['jira', 'tickets', 'comments', 'communication', 'discussion'],
+        categories: ['jira', 'comments', 'communication']
+      },
+      'get_jira_issue_transitions': {
+        description: 'Get available transitions for a Jira issue',
+        contexts: ['jira', 'workflow', 'status', 'transitions'],
+        categories: ['jira', 'workflow', 'status']
+      },
+      'search_jira_issues': {
+        description: 'Search for Jira issues using JQL',
+        contexts: ['jira', 'search', 'query', 'filter', 'find'],
+        categories: ['jira', 'search', 'query']
+      },
+      'get_jira_issue_watchers': {
+        description: 'Get watchers of a Jira issue',
+        contexts: ['jira', 'watchers', 'users', 'notifications'],
+        categories: ['jira', 'users', 'watchers']
+      },
+      'get_jira_issue_attachments': {
+        description: 'Get attachments of a Jira issue',
+        contexts: ['jira', 'attachments', 'files', 'documents'],
+        categories: ['jira', 'attachments', 'files']
+      },
+      'get_jira_issue_sprints': {
+        description: 'Get sprints associated with a Jira issue',
+        contexts: ['jira', 'sprints', 'agile', 'scrum'],
+        categories: ['jira', 'sprints', 'agile']
+      }
+    };
+    
+    // Build the tool objects with metadata
+    for (const name of toolNames) {
+      const metadata = toolMetadata[name] || { 
+        description: `Tool: ${name}`,
+        contexts: [],
+        categories: []
+      };
+      
+      allTools.push({
+        name,
+        description: metadata.description,
+        inputSchema: {}, // We can't easily retrieve the actual input schema here
+        contexts: metadata.contexts,
+        categories: metadata.categories
+      });
+    }
+    
+    // Apply filtering based on detected context
+    let filteredTools = allTools.filter(tool => {
+      // Match by context if provided
+      return tool.contexts.some((c: string) => 
+        context.toLowerCase().split(',').some(contextPart => 
+          c.toLowerCase().includes(contextPart.trim()) || 
+          contextPart.trim().includes(c.toLowerCase())
+        )
+      );
+    });
+    
+    // If no tools match the context, return empty array
+    if (filteredTools.length === 0) {
+      console.error(`[LOG][TOOLS] No matching tools found for context: ${context}`);
+      res.json({
+        tools: [],
+        metadata: {
+          timestamp: new Date().toISOString(),
+          requestId: crypto.randomUUID(),
+          filtered: true,
+          originalCount: allTools.length,
+          returnedCount: 0,
+          reductionPercent: 100,
+          reason: 'no_matching_tools'
+        }
+      });
+      return;
+    }
+    
+    // Additional category filtering if specified
+    if (category) {
+      filteredTools = filteredTools.filter(tool => {
+        return tool.categories.some((c: string) => 
+          c.toLowerCase().includes(category.toLowerCase()) ||
+          category.toLowerCase().includes(c.toLowerCase())
+        );
+      });
+    }
+    
+    // Track metrics
+    if (filteredTools.length < allTools.length) {
+      toolMetrics.trackToolTokens(filteredTools, 'filtered');
+    } else {
+      toolMetrics.trackToolTokens(filteredTools, 'baseline');
+    }
+    
+    console.error(`[LOG][TOOLS] Returning ${filteredTools.length} tools out of ${allTools.length}`);
+    
+    // Return the filtered tools
+    res.json({
+      tools: filteredTools,
+      metadata: {
+        timestamp: new Date().toISOString(),
+        requestId: crypto.randomUUID(),
+        filtered: true,
+        originalCount: allTools.length,
+        returnedCount: filteredTools.length,
+        reductionPercent: Math.round(((allTools.length - filteredTools.length) / allTools.length) * 100),
+        appliedContext: context
+      }
+    });
+  } catch (error) {
+    console.error(`[ERROR][TOOLS] Error in tool discovery:`, error);
+    res.status(500).json({
+      error: 'Internal server error during tool discovery',
+      message: error instanceof Error ? error.message : 'Unknown error'
+    });
+  }
+});
+
+// Add endpoint to view current metrics
+app.get('/tools/metrics', (req: Request, res: Response) => {
+  res.json(toolMetrics.getMetricsReport());
+});
+
+// Add endpoint to reset metrics
+app.post('/tools/metrics/reset', (req: Request, res: Response) => {
+  toolMetrics.resetMetrics();
+  res.json({ message: 'Metrics reset successfully' });
 });
 
 const port = 3333;
