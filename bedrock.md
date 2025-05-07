@@ -1,109 +1,219 @@
-# Integração Claude 3.5 Haiku via AWS Bedrock
+# Implementação da integração com Claude via AWS Bedrock e API Anthropic
 
-## Objetivo
-Permitir que o usuário escolha entre assistentes OpenAI (GPT) ou Claude (via AWS Bedrock, modelo Haiku 3.5) na interface web, com suporte a tool use (function calling) dinâmico via MCP. Agora, apenas a ferramenta de notas (`create_note`) está disponível.
+## 1. Visão Geral
 
----
+Este documento detalha a implementação da integração com o modelo Claude da Anthropic, através de duas abordagens distintas:
 
-## 1. Pré-requisitos
-- Conta AWS com Bedrock habilitado e acesso ao modelo Claude 3.5 Haiku (`anthropic.claude-3-haiku-20240307-v1:0`).
-- Chaves de acesso AWS (Access Key ID, Secret Access Key, região).
-- Node.js >= 18.
-- Dependências: `@aws-sdk/client-bedrock-runtime`, `dotenv`, `@modelcontextprotocol/sdk`.
+1. **AWS Bedrock**: Utiliza a AWS como intermediária para acessar o modelo Claude
+2. **API Anthropic Direta**: Integração direta com a API da Anthropic usando o SDK oficial
 
----
+Ambas as abordagens suportam ferramentas (tool use) e permitem manter o contexto de conversas, mas possuem diferenças importantes na implementação e comportamento.
 
-## 2. Configuração AWS Bedrock
+## 2. Modelos Claude Suportados
 
-1. Instale o SDK:
-   ```sh
-   npm install @aws-sdk/client-bedrock-runtime
-   ```
-2. Configure as credenciais AWS em `.env`:
-   ```env
-   AWS_ACCESS_KEY_ID=your-access-key
-   AWS_SECRET_ACCESS_KEY=your-secret-key
-   AWS_REGION=us-east-1
-   ```
+| Modelo | API Anthropic | AWS Bedrock | 
+|--------|---------------|-------------|
+| Claude 3.7 Sonnet | claude-3-7-sonnet-20250219 | anthropic.claude-3-7-sonnet-20250219-v1:0 |
+| Claude 3.5 Haiku | claude-3-5-haiku-20241022 | anthropic.claude-3-5-haiku-20241022-v1:0 |
+| Claude 3.5 Sonnet v2 | claude-3-5-sonnet-20241022 | anthropic.claude-3-5-sonnet-20241022-v2:0 |
+| Claude 3.5 Sonnet | claude-3-5-sonnet-20240620 | anthropic.claude-3-5-sonnet-20240620-v1:0 |
+| Claude 3 Opus | claude-3-opus-20240229 | anthropic.claude-3-opus-20240229-v1:0 |
+| Claude 3 Sonnet | claude-3-sonnet-20240229 | anthropic.claude-3-sonnet-20240229-v1:0 |
+| Claude 3 Haiku | claude-3-haiku-20240307 | anthropic.claude-3-haiku-20240307-v1:0 |
 
----
+## 3. Implementação AWS Bedrock
 
-## 3. Chamada ao Claude Haiku 3.5 com Tool Use
+### 3.1 Configuração
 
-```js
+```typescript
+// Importação do cliente Bedrock
 import { BedrockRuntimeClient, InvokeModelCommand } from "@aws-sdk/client-bedrock-runtime";
-import dotenv from "dotenv";
-dotenv.config();
 
-const bedrock = new BedrockRuntimeClient({ region: process.env.AWS_REGION });
+// Inicialização do cliente
+const bedrockClient = new BedrockRuntimeClient({ 
+  region: process.env.AWS_REGION || 'us-east-1',
+  credentials: {
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID || '',
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || ''
+  }
+});
+```
 
+### 3.2 Função para chamar Claude via Bedrock
+
+```typescript
 async function callClaudeHaiku(messages, tools) {
-  const body = {
+  const modelId = "anthropic.claude-3-haiku-20240307-v1:0";
+  
+  const input = {
     anthropic_version: "bedrock-2023-05-31",
     max_tokens: 1024,
-    messages,
-    tools
+    messages: messages,
+    tools: tools,
+    temperature: 0.7,
   };
+
   const command = new InvokeModelCommand({
-    modelId: "anthropic.claude-3-haiku-20240307-v1:0",
+    modelId: modelId,
     contentType: "application/json",
     accept: "application/json",
-    body: JSON.stringify(body),
+    body: JSON.stringify(input),
   });
-  const response = await bedrock.send(command);
+
+  try {
+    const response = await bedrockClient.send(command);
   const responseBody = JSON.parse(new TextDecoder().decode(response.body));
   return responseBody;
+  } catch (error) {
+    console.error("Erro ao chamar Claude via Bedrock:", error);
+    throw error;
+  }
 }
 ```
 
----
+### 3.3 Características e Limitações da Abordagem Bedrock
 
-## 4. Fluxo Conversacional e Tool Use
+- **Gestão de Histórico**: O histórico de mensagens é mantido pelo frontend e enviado a cada requisição.
+- **Autenticação**: Utiliza credenciais AWS (ACCESS_KEY e SECRET_KEY).
+- **Tool Use**: Funcionamento menos consistente com as ferramentas, às vezes não reconhecendo corretamente a execução da ferramenta.
+- **Formatos de Mensagens**: Formatação menos rigorosa, mas também mais propenso a erros.
+- **Vantagens**: Integração simplificada com infraestrutura AWS existente, gestão de cotas via AWS.
 
-- O **frontend** mantém o histórico completo de mensagens (usuário e assistente) em memória por sessão (enquanto a aba estiver aberta).
-- A cada requisição para Claude/Bedrock, o frontend envia o histórico completo no campo `history`.
-- O **backend** processa esse histórico, executa tool use conforme necessário e retorna a resposta final ao frontend.
-- O backend não persiste histórico entre sessões.
-- O único tool use disponível é `create_note` (criação de notas).
+## 4. Implementação API Anthropic Direta
 
-### Exemplo de fluxo:
-1. Usuário envia mensagem pelo chat web.
-2. Frontend adiciona a mensagem ao histórico e envia todo o histórico para o backend.
-3. Backend processa o histórico, chama Claude, executa tool use se necessário, e retorna a resposta.
-4. Frontend adiciona a resposta ao histórico.
+### 4.1 Configuração
 
----
+```typescript
+import Anthropic from '@anthropic-ai/sdk';
+import { v4 as uuidv4 } from 'uuid';
 
-## 5. Estrutura para Seleção de Modelo (OpenAI x Bedrock)
+// Inicialização do cliente Anthropic
+const anthropic = new Anthropic({
+  apiKey: process.env.ANTHROPIC_API_KEY || '',
+});
+```
 
-- O usuário pode escolher entre OpenAI (com threads nativas) ou Claude (Bedrock) na interface web.
-- Para Claude, o contexto é sempre enviado pelo frontend.
-- Para OpenAI, o contexto é gerenciado por thread/conversationId nativo.
+### 4.2 Função para chamar Claude via API direta
 
----
+```typescript
+async function callClaudeDirectAPI(messages, tools) {
+  try {
+    const formattedMessages = formatMessagesForAnthropic(messages);
+    const formattedTools = convertMcpToolsToAnthropicFormat(tools);
+    
+    const response = await anthropic.messages.create({
+      model: "claude-3-5-haiku-20241022",
+      max_tokens: 1024,
+      messages: formattedMessages,
+      tools: formattedTools,
+      temperature: 0.7,
+    });
+    
+    return response;
+  } catch (error) {
+    console.error("Erro ao chamar Anthropic API:", error);
+    throw error;
+  }
+}
+```
 
-## 6. Riscos e Boas Práticas
-- **Limites de uso:** Bedrock pode ter limites de requisições e custos.
-- **Limite de contexto:** O histórico enviado deve ser limitado para não exceder o limite de tokens do modelo.
-- **Segurança:** Nunca exponha chaves AWS no frontend.
-- **Logs e monitoramento:** Logar chamadas e respostas para troubleshooting.
-- **Persistência:** O histórico é perdido ao fechar a aba do navegador.
+### 4.3 Gerenciamento de ferramentas (tool use)
 
----
+```typescript
+async function handleToolExecution(toolUse, executeTool, messageHistory) {
+  const { name, input } = toolUse;
+  const toolUseId = toolUse.id || uuidv4();
+  
+  try {
+    const toolResult = await executeTool(name, input);
+    const resultContent = toolResult?.content?.[0]?.text || JSON.stringify(toolResult);
+    
+    // Adiciona mensagem do assistente com a chamada da ferramenta
+    messageHistory.push({
+      role: "assistant",
+      content: [
+        {
+          type: "tool_use",
+          id: toolUseId,
+          name,
+          input
+        }
+      ]
+    });
+    
+    // Adiciona mensagem do usuário com o resultado da ferramenta
+    messageHistory.push({
+      role: "user",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: toolUseId,
+          content: resultContent
+        }
+      ]
+    });
+    
+    return { messageHistory, toolResult };
+  } catch (error) {
+    // Tratamento de erro...
+    return { messageHistory, error };
+  }
+}
+```
 
-## 7. Exemplo de Uso
+### 4.4 Características da Abordagem API Direta
 
-- **Chat:**
-  - Você: oi
-  - Agente: Olá! Como posso ajudar você hoje?
-  - Você: crie uma nota chamada Teste com conteúdo Olá mundo
-  - Agente: Nota criada com sucesso: Teste
+- **Gestão de Histórico**: Implementação robusta com correto encadeamento de mensagens e ferramentas.
+- **Autenticação**: Utiliza chave de API da Anthropic.
+- **Tool Use**: Implementação confiável seguindo as especificações exatas da API Anthropic.
+- **Formatos de Mensagens**: Tratamento rigoroso dos formatos de mensagens e respostas.
+- **Tipagem**: Melhor tipagem com TypeScript utilizando tipos do SDK oficial.
+- **Vantagens**: Reconhecimento consistente de ferramentas, suporte nativo a tool_use e tool_result.
 
-- **Notas Criadas:**
-  - First Note: This is note 1
-  - Second Note: This is note 2
-  - Teste: Olá mundo
+## 5. Comparação entre as Abordagens
 
----
+| Característica | AWS Bedrock | API Anthropic Direta |
+|----------------|-------------|----------------------|
+| Configuração | Credenciais AWS | Chave API Anthropic |
+| Tool Use | Menos consistente | Mais confiável |
+| Controle de Formato | Menos rigoroso | Mais rigoroso |
+| Gestão de Histórico | Pelo frontend | Pelo backend e frontend |
+| Custo | Faturamento AWS | Faturamento Anthropic |
+| Limites de API | Gerenciado via AWS | Gerenciado pela Anthropic |
+| Correção de IDs | Não necessário | Necessário ajustar IDs entre tool_use e tool_result |
 
-**Com isso, seu sistema está pronto para alternar entre OpenAI e Claude (Bedrock) como assistente, com suporte a tool use dinâmico via MCP apenas para notas.** 
+## 6. Integração com o Frontend
+
+O frontend permite que o usuário escolha entre as opções através de um dropdown:
+
+```html
+<select id="modelSelect">
+  <option value="openai">OpenAI</option>
+  <option value="claude">Claude (Bedrock)</option>
+  <option value="anthropic">Claude (API Direct)</option>
+</select>
+```
+
+## 7. Fluxo de processamento
+
+1. **Fluxo Bedrock**:
+   - Recebe mensagem do usuário + histórico de mensagens
+   - Converte tools MCP para formato Claude
+   - Chama AWS Bedrock com a mensagem e ferramentas
+   - Processa resposta do modelo
+   - Se houver tool_use, executa a ferramenta e adiciona o resultado ao histórico
+   - Retorna resposta final ao usuário
+
+2. **Fluxo API Direta**:
+   - Recebe mensagem do usuário
+   - Formata corretamente as mensagens para o formato Anthropic
+   - Chama API Anthropic
+   - Se houver tool_use, executa a ferramenta e adiciona tanto a chamada quanto o resultado ao histórico
+   - Faz nova chamada à API com o histórico atualizado
+   - Retorna resposta final ao usuário
+
+## 8. Conclusão
+
+A implementação via API Direta da Anthropic oferece uma experiência mais robusta para tool use, eliminando problemas onde o modelo repetidamente chama ferramentas sem reconhecer que já foram executadas. A formatação correta das mensagens e o tratamento adequado dos IDs de tool_use e tool_result garantem que o Claude entenda corretamente quando uma ferramenta foi executada e receba apropriadamente os resultados.
+
+Ambas as abordagens são mantidas no projeto para oferecer maior flexibilidade, permitindo que o usuário escolha de acordo com suas preferências ou necessidades específicas. 

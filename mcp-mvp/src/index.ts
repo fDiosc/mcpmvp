@@ -345,7 +345,7 @@ app.use(express.json());
 
 const bedrock = new BedrockRuntimeClient({ region: process.env.AWS_REGION });
 
-async function callClaudeHaiku(messages: any[], tools: any[]) {
+async function callClaudeHaiku(messages: any[], tools: any[], sessionIdentifier: string) {
   const body = {
     anthropic_version: "bedrock-2023-05-31",
     max_tokens: 1024,
@@ -424,7 +424,7 @@ app.post('/chat', async (req: Request, res: Response) => {
             break;
           }
           console.error('[LOG][CHAT] Calling Claude with:', { messages, toolsClaude });
-          response = await callClaudeHaiku(messages, toolsClaude);
+          response = await callClaudeHaiku(messages, toolsClaude, '');
           console.error('[LOG][CHAT] Claude response:', response);
         } catch (err) {
           console.error('[Bedrock Claude] Error on Claude call:', err);
@@ -505,6 +505,11 @@ app.post('/chat', async (req: Request, res: Response) => {
       // Convert MCP tools to Anthropic format
       const anthropicTools = convertMcpToolsToAnthropicFormat(mcpTools.tools);
       
+      // Create a unique session identifier based on client IP and user agent
+      const clientIp = req.ip || '127.0.0.1';
+      const userAgent = req.get('user-agent') || 'unknown';
+      const sessionIdentifier = `${clientIp}-${userAgent}`;
+      
       try {
         // Process multi-turn conversation with tool calls
         let isToolCallPending = true;
@@ -516,8 +521,8 @@ app.post('/chat', async (req: Request, res: Response) => {
         while (isToolCallPending && recursionCount < MAX_RECURSIONS) {
           console.error(`[LOG][ANTHROPIC] Processing turn ${recursionCount + 1}, message history length: ${messageHistory.length}`);
           
-          // Call Anthropic API
-          const claudeResponse = await callClaudeDirectAPI(messageHistory, anthropicTools);
+          // Call Anthropic API with session identifier
+          const claudeResponse = await callClaudeDirectAPI(messageHistory, anthropicTools, sessionIdentifier);
           
           // Extract text response
           const textContents = claudeResponse.content
