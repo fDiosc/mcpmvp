@@ -1,28 +1,63 @@
-# Changelog e Marcos de Implementação
+# MCP MVP Implementation Status
 
-## Mudanças Principais
+This document provides a summary of the current implementation status of the MCP MVP project.
 
-- Integração direta com API Anthropic (Claude) e OpenAI Assistants API
-- Implementação de prompt caching (Anthropic) para redução de custos
-- Expansão das ferramentas Jira (várias operações)
-- Interface web aprimorada para chat, seleção de modelo e listagem de notas
-- Scripts de testes automatizados para interface e ferramentas
+## Current Status (as of last update)
 
-## Marcos
+The project has implemented a fully functional MCP server with client libraries and multiple LLM integrations.
 
-- **v1.0**: MVP funcional com OpenAI, Claude (Bedrock e API Direta), notas e Jira
-- **v1.1**: Prompt caching Anthropic, logging detalhado de tokens, otimização de payload de ferramentas
-- **v1.2**: Integração OpenAI Direct, normalização de fluxos multi-modelo, melhorias de UX
+### Key Features
 
-## Próximos Passos
+1. **Dynamic Context-Based Tool Loading**
+   - *Status: Complete* - The system now implements conditional tool loading based on detected context
+   - *Behavior:* 
+     - No context detected → No tools loaded
+     - Context detected → Only relevant tools loaded
+   - *Files*: `src/client/dynamicTools.ts`, `src/index.ts` (/tools endpoint)
 
-- Testes avançados de multi-turn e tool chaining
-- Melhorias de feedback de erro e tratamento de quotas
-- Opções de configuração avançada de modelos
-- Streaming de respostas e tracking de tokens
+2. **OpenAI Integration**
+   - *Status: Complete* - Full support for OpenAI Assistants API with MCP tools
+   - *Files*: `src/client/agents/assistant.ts`
 
-## Para detalhes técnicos:
-- [Integração OpenAI](./integracao-openai.md)
-- [Integração Claude](./integracao-claude.md)
-- [Prompt Caching & Otimização](./prompt-caching-e-otimizacao.md)
-- [Jira Tools](./jira-tools.md) 
+3. **Claude Integration**
+   - *Status: Complete* - Support for both AWS Bedrock and direct Anthropic API
+   - *Files*: `src/anthropicClient.ts`, `src/index.ts` (chat endpoint)
+
+4. **Web Interface**
+   - *Status: Complete* - Simple web interface for interacting with models
+   - *Files*: `src/web/index.html`
+
+5. **MCP Tools**
+   - *Status: Complete* - Various tools implemented:
+     - Notes creation/retrieval
+     - Jira integration (multiple tools)
+   - *Files*: `src/index.ts`, `src/jiraTool.ts`
+
+6. **Tool Metrics**
+   - *Status: Complete* - Token usage tracking system
+   - *Files*: `src/index.ts` (toolMetrics object)
+
+## Recently Completed
+
+- Implementation of fully context-based tool loading
+- Updated documentation to reflect current behaviors
+- Enhanced client-side context detection
+
+## Next Steps
+
+Potential next steps for the project:
+
+1. Advanced context detection with more sophisticated NLP
+2. Additional tool integrations
+3. Enhanced frontend with conversation history visualization
+4. Performance optimization for large-scale deployments
+
+## Testing
+
+All features can be tested through:
+
+1. The web interface at `http://localhost:3333`
+2. Direct API calls to the server endpoints
+3. Running dedicated test scripts (`npm run test:*`)
+
+For detailed implementation of each component, please refer to the respective documentation files. 

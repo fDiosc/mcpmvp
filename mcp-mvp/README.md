@@ -6,6 +6,16 @@ A Model Context Protocol (MCP) server implementation with OpenAI and Claude inte
 
 This project implements a local Model Context Protocol (MCP) server that can be used with OpenAI assistants and Claude models. The server provides tools for creating notes and fetching Jira issues, and exposes them through the MCP protocol.
 
+## Recent Updates
+
+**October 2023: Context-Based Tool Loading**
+
+- Implemented smart context detection from user messages
+- Tools are now only loaded when relevant context is detected
+- If no context is detected, no tools are loaded at all
+- Results in significant token savings and improved response times
+- Full documentation in [Dynamic Tools Documentation](docs/dynamicTools.md)
+
 ## Features
 
 - Local MCP server with SSE transport
@@ -86,18 +96,30 @@ The web interface provides:
 
 ## Dynamic Tool Discovery
 
-The server includes a new dynamic tool discovery feature to reduce token usage when working with large tool sets:
+The server includes an intelligent context-based tool discovery feature to reduce token usage when working with large tool sets. The system now implements the following behavior:
+
+1. If no context is detected in a message, no tools are loaded, regardless of whether it's the first message or later in a conversation.
+2. As soon as the model detects an intent/context, it will load only the tools relevant to that context.
+
+### Context Detection
+
+The system automatically analyzes user messages to identify relevant contexts:
+
+- **Jira context**: Detected when messages contain terms like "ticket", "issue", "sprint", or Jira issue keys (e.g., "PROJ-123")
+- **Notes context**: Detected for terms like "note", "memo", "write", "document"
+- **Agile context**: Detected for terms like "sprint", "agile", "scrum", "kanban"
+- **Other contexts**: Communication, search, documents, and users
 
 ### Using Dynamic Tools
 
 1. **API Endpoints**:
-   - GET `/tools` - Fetches tools based on context
+   - GET `/tools` - Fetches tools based on detected context
    - GET `/tools/metrics` - View token usage metrics
    - POST `/tools/metrics/reset` - Reset metrics
 
 2. **Query Parameters**:
-   - `context` - The current conversation context (e.g., "email", "finance")
-   - `category` - Tool category (e.g., "communication", "search")
+   - `context` - The current conversation context (e.g., "jira", "notes")
+   - `category` - Tool category (e.g., "retrieval", "creation")
    - `userId` - User identifier for personalized access
 
 3. **Client Library**:
@@ -107,8 +129,11 @@ The server includes a new dynamic tool discovery feature to reduce token usage w
    // Create a dynamic tools client
    const dynamicClient = new DynamicToolClient(mcpClient);
    
-   // Get tools with context
-   const emailTools = await dynamicClient.getTools({ context: 'email' });
+   // Automatic context detection from user message
+   const tools = await dynamicClient.getToolsFromMessage(userMessage);
+   
+   // Or manually specify context
+   const jiraTools = await dynamicClient.getTools({ context: 'jira' });
    ```
 
 4. **Testing**:
@@ -123,7 +148,14 @@ The server includes a new dynamic tool discovery feature to reduce token usage w
    npm run tools:reset-metrics
    ```
 
-For more details on the implementation and roadmap, see the [Dynamic Tools Documentation](docs/dynamicTools.md).
+### Benefits
+
+- **Reduced Token Usage**: By only sending relevant tools to the model, token usage is significantly reduced
+- **Improved Response Time**: Models process requests faster with fewer tools
+- **Context-Aware Responses**: Tools are only presented when relevant to the user's intent
+- **Zero-Tool Mode**: When no context is detected, the model operates without tools, saving tokens
+
+For complete implementation details, refer to the source code in `src/client/dynamicTools.ts` and the endpoint in `src/index.ts`.
 
 ## Troubleshooting
 

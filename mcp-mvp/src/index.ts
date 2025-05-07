@@ -463,33 +463,38 @@ app.post('/chat', async (req: Request, res: Response) => {
     
     // Create dynamic tool client if not already created
     let dynamicToolClient = new DynamicToolClient(mcpClient);
-    
-    // Always use context detection for tool loading (requirements #1 and #2)
-    // Extract context from user input and fetch relevant tools
-    console.error('[LOG][CHAT] Analyzing user input for context detection...');
-    const contexts = extractContextFromMessage(userInput);
-    
     let mcpTools;
-    if (contexts.length > 0) {
-      // Context detected, load respective tools
-      console.error(`[LOG][CHAT] Context detected: ${contexts.join(', ')}`);
-      mcpTools = await dynamicToolClient.getToolsFromMessage(userInput);
-      console.error(`[LOG][CHAT] Loaded ${mcpTools.tools.length} tools for detected context`);
+    const enableContextFiltering = process.env.ENABLE_CONTEXT_FILTERING === 'true';
+    if (enableContextFiltering) {
+      // Context-based filtering (current behavior)
+      console.error('[LOG][CHAT] Analyzing user input for context detection...');
+      const contexts = extractContextFromMessage(userInput);
+      if (contexts.length > 0) {
+        // Context detected, load respective tools
+        console.error(`[LOG][CHAT] Context detected: ${contexts.join(', ')}`);
+        mcpTools = await dynamicToolClient.getToolsFromMessage(userInput);
+        console.error(`[LOG][CHAT] Loaded ${mcpTools.tools.length} tools for detected context`);
+      } else {
+        // No context detected, use empty tools array
+        console.error('[LOG][CHAT] No context detected, using empty tools array');
+        mcpTools = { 
+          tools: [],
+          metadata: {
+            timestamp: new Date().toISOString(),
+            requestId: crypto.randomUUID().toString(),
+            filtered: false,
+            originalCount: 0,
+            returnedCount: 0,
+            reductionPercent: 0,
+            reason: 'no_context_detected'
+          }
+        };
+      }
     } else {
-      // No context detected, use empty tools array
-      console.error('[LOG][CHAT] No context detected, using empty tools array');
-      mcpTools = { 
-        tools: [],
-        metadata: {
-          timestamp: new Date().toISOString(),
-          requestId: crypto.randomUUID().toString(),
-          filtered: false,
-          originalCount: 0,
-          returnedCount: 0,
-          reductionPercent: 0,
-          reason: 'no_context_detected'
-        }
-      };
+      // Filtering disabled: always send all tools
+      console.error('[LOG][CHAT] Context filtering disabled, loading all tools');
+      mcpTools = await dynamicToolClient.getTools({});
+      console.error(`[LOG][CHAT] Loaded ${mcpTools.tools.length} tools (unfiltered)`);
     }
     
     // Format tools for Bedrock Claude
@@ -735,6 +740,7 @@ app.post('/chat', async (req: Request, res: Response) => {
 // Add new endpoint for dynamic tool discovery
 app.get('/tools', (req: Request, res: Response) => {
   try {
+    const enableContextFiltering = process.env.ENABLE_CONTEXT_FILTERING === 'true';
     // Extract query parameters (for future filtering)
     const context = req.query.context as string | undefined;
     const category = req.query.category as string | undefined;
@@ -742,24 +748,6 @@ app.get('/tools', (req: Request, res: Response) => {
     
     // Log the request
     console.error(`[LOG][TOOLS] Tool discovery request received: context=${context}, category=${category}, userId=${userId}`);
-    
-    // If no context detected, return empty tools array (requirement #1)
-    if (!context) {
-      console.error('[LOG][TOOLS] No context detected, returning empty tools array');
-      res.json({
-        tools: [],
-        metadata: {
-          timestamp: new Date().toISOString(),
-          requestId: crypto.randomUUID(),
-          filtered: false,
-          originalCount: 0,
-          returnedCount: 0,
-          reductionPercent: 0,
-          reason: 'no_context_detected'
-        }
-      });
-      return;
-    }
     
     // Get all tools from the MCP server
     // Since the McpServer API doesn't have a public way to directly access all tools,
@@ -845,16 +833,36 @@ app.get('/tools', (req: Request, res: Response) => {
       });
     }
     
-    // Apply filtering based on detected context
-    let filteredTools = allTools.filter(tool => {
-      // Match by context if provided
-      return tool.contexts.some((c: string) => 
-        context.toLowerCase().split(',').some(contextPart => 
-          c.toLowerCase().includes(contextPart.trim()) || 
-          contextPart.trim().includes(c.toLowerCase())
-        )
-      );
-    });
+    if (!enableContextFiltering) {
+      // Filtering disabled: always return all tools
+      console.error('[LOG][TOOLS] Context filtering disabled, returning all tools');
+      res.json({
+        tools: allTools,
+        metadata: {
+          timestamp: new Date().toISOString(),
+          requestId: crypto.randomUUID(),
+          filtered: false,
+          originalCount: allTools.length,
+          returnedCount: allTools.length,
+          reductionPercent: 0,
+          reason: 'context_filtering_disabled'
+        }
+      });
+      return;
+    }
+    
+    let filteredTools = allTools;
+    if (enableContextFiltering && context) {
+      filteredTools = allTools.filter(tool => {
+        // Match by context if provided
+        return tool.contexts.some((c: string) => 
+          context.toLowerCase().split(',').some(contextPart => 
+            c.toLowerCase().includes(contextPart.trim()) || 
+            contextPart.trim().includes(c.toLowerCase())
+          )
+        );
+      });
+    }
     
     // If no tools match the context, return empty array
     if (filteredTools.length === 0) {
