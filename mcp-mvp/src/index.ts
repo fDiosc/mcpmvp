@@ -17,7 +17,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
-import { createAssistant, createThread, sendMessage, createAssistantWithMcpServer } from './client/agents/assistant.js';
+import { createAssistant, createThread, sendMessage, createAssistantWithMcpServer, createDynamicAssistant } from './client/agents/assistant.js';
 import { 
   getJiraIssueTool, 
   getJiraIssueInputSchema, 
@@ -513,8 +513,8 @@ app.post('/chat', async (req: Request, res: Response) => {
           if (selectedModel === 'openai') {
             // OpenAI: precisa de thread e assistant
             if (!assistant) {
-              assistant = await createAssistantWithMcpServer('http://localhost:3333/mcp');
-              console.error('[LOG][CHAT] OpenAI assistant created with MCP server');
+              assistant = await createDynamicAssistant(mcpClient);
+              console.error('[LOG][CHAT] OpenAI assistant created with MCP tools as functions');
             }
             if (!thread) {
               thread = await createThread();
@@ -602,8 +602,8 @@ app.post('/chat', async (req: Request, res: Response) => {
     if (selectedModel === 'openai') {
       // OpenAI flow (using assistant and thread)
       if (!assistant) {
-        assistant = await createAssistantWithMcpServer('http://localhost:3333/mcp');
-        console.error('[LOG][CHAT] OpenAI assistant created with MCP server');
+        assistant = await createDynamicAssistant(mcpClient);
+        console.error('[LOG][CHAT] OpenAI assistant created with MCP tools as functions');
       }
       if (!thread) {
         thread = await createThread();

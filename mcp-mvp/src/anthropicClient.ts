@@ -378,6 +378,21 @@ function findLastIndex<T>(array: T[], predicate: (value: T) => boolean): number 
   return -1;
 }
 
+// Função utilitária para converter snake_case para camelCase
+function snakeToCamel(obj: any): any {
+  if (Array.isArray(obj)) {
+    return obj.map(snakeToCamel);
+  } else if (obj && typeof obj === 'object') {
+    return Object.fromEntries(
+      Object.entries(obj).map(([k, v]) => [
+        k.replace(/_([a-z])/g, (_, c) => c.toUpperCase()),
+        snakeToCamel(v)
+      ])
+    );
+  }
+  return obj;
+}
+
 // Function to handle tool execution and format responses properly
 export async function handleToolExecution(
   toolUse: any, 
@@ -391,8 +406,10 @@ export async function handleToolExecution(
   console.log(`[LOG][ANTHROPIC] Executing tool: ${name}`);
   
   try {
+    // Normaliza argumentos para camelCase
+    const normalizedInput = snakeToCamel(input);
     // Execute the tool with the provided input
-    const toolResult = await executeTool(name, input);
+    const toolResult = await executeTool(name, normalizedInput);
     console.log(`[LOG][ANTHROPIC] Tool result received`);
     
     // Format the tool result in the way Claude expects
