@@ -170,6 +170,29 @@ server.prompt(
   }
 );
 
+// Prompt MCP para seleção de ferramentas pelo LLM
+server.prompt(
+  "tool_selection",
+  {
+    userMessage: z.string().describe("Mensagem do usuário"),
+    toolsText: z.string().describe("Lista de ferramentas disponíveis em texto formatado")
+  },
+  async ({ userMessage, toolsText }: { userMessage: string, toolsText: string }, _extra: any) => {
+    const promptText = `\nUsuário enviou a seguinte mensagem:\n"${userMessage}"\n\nLista de ferramentas disponíveis:\n${toolsText}\n\nQuais ferramentas são relevantes para atender ao pedido do usuário?\nResponda apenas com uma lista de nomes de ferramentas, separados por vírgula.`;
+    return {
+      messages: [
+        {
+          role: "user" as const,
+          content: {
+            type: "text" as const,
+            text: promptText
+          }
+        }
+      ]
+    };
+  }
+);
+
 // Existing Jira tool registration
 server.tool(
   "get_jira_issue",
@@ -464,35 +487,102 @@ app.post('/chat', async (req: Request, res: Response) => {
     // Create dynamic tool client if not already created
     let dynamicToolClient = new DynamicToolClient(mcpClient);
     let mcpTools;
+    let toolSelectionMethod = '';
     const enableContextFiltering = process.env.ENABLE_CONTEXT_FILTERING === 'true';
     if (enableContextFiltering) {
-      // Context-based filtering (current behavior)
-      console.error('[LOG][CHAT] Analyzing user input for context detection...');
+      // 1. Tenta keyword mapping
+      console.error('[LOG][CHAT] Analyzing user input for context detection (keyword mapping)...');
       const contexts = extractContextFromMessage(userInput);
       if (contexts.length > 0) {
         // Context detected, load respective tools
-        console.error(`[LOG][CHAT] Context detected: ${contexts.join(', ')}`);
+        toolSelectionMethod = 'keyword';
+        console.error(`[LOG][CHAT] [TOOL_SELECTION] Method: keyword | Context detected: ${contexts.join(', ')}`);
         mcpTools = await dynamicToolClient.getToolsFromMessage(userInput);
         console.error(`[LOG][CHAT] Loaded ${mcpTools.tools.length} tools for detected context`);
       } else {
-        // No context detected, use empty tools array
-        console.error('[LOG][CHAT] No context detected, using empty tools array');
-        mcpTools = { 
-          tools: [],
-          metadata: {
-            timestamp: new Date().toISOString(),
-            requestId: crypto.randomUUID().toString(),
-            filtered: false,
-            originalCount: 0,
-            returnedCount: 0,
-            reductionPercent: 0,
-            reason: 'no_context_detected'
+        // 2. Se não encontrou contexto, tenta seleção contextual via LLM
+        toolSelectionMethod = 'contextual';
+        console.error(`[LOG][CHAT] [TOOL_SELECTION] Method: contextual | No context detected, using LLM-assisted tool selection with model: ${selectedModel}`);
+        // Busca todas as ferramentas disponíveis
+        const allTools = await dynamicToolClient.getTools({});
+        const toolsText = allTools.tools.map((t: any) => `- ${t.name}: ${t.description}`).join('\n');
+        // Prompt para seleção contextual
+        const promptText = `\nUsuário enviou a seguinte mensagem:\n"${userInput}"\n\nLista de ferramentas disponíveis:\n${toolsText}\n\nQuais ferramentas são relevantes para atender ao pedido do usuário?\nResponda apenas com uma lista de nomes de ferramentas, separados por vírgula.`;
+        let llmResponse = '';
+        try {
+          if (selectedModel === 'openai') {
+            // OpenAI: precisa de thread e assistant
+            if (!assistant) {
+              assistant = await createAssistantWithMcpServer('http://localhost:3333/mcp');
+              console.error('[LOG][CHAT] OpenAI assistant created with MCP server');
+            }
+            if (!thread) {
+              thread = await createThread();
+              console.error('[LOG][CHAT] OpenAI thread created');
+            }
+            llmResponse = await sendMessage(mcpClient, thread.id, assistant.id, promptText);
+            console.error('[LOG][CHAT] [TOOL_SELECTION] LLM (OpenAI) response for tool selection:', llmResponse);
+          } else if (selectedModel === 'anthropic') {
+            // Claude API Direct
+            const messages = [{ role: 'user' as const, content: [{ type: 'text' as const, text: promptText }] }];
+            const response = await callClaudeDirectAPI(messages, [], undefined);
+            llmResponse = response.content && Array.isArray(response.content) && response.content[0]?.type === 'text' ? response.content[0].text : '';
+            console.error('[LOG][CHAT] [TOOL_SELECTION] LLM (Claude API Direct) response for tool selection:', llmResponse);
+          } else if (selectedModel === 'bedrock') {
+            // Claude Bedrock
+            const messages = [{ role: 'user', content: promptText }];
+            const response = await callClaudeHaiku(messages, [], '');
+            llmResponse = response?.content?.[0]?.text || '';
+            console.error('[LOG][CHAT] [TOOL_SELECTION] LLM (Claude Bedrock) response for tool selection:', llmResponse);
+          } else {
+            throw new Error('Modelo não suportado para seleção contextual');
           }
-        };
+        } catch (err) {
+          console.error('[LOG][CHAT] [TOOL_SELECTION] Error calling LLM for tool selection:', err);
+        }
+        // Parseia a resposta do LLM para obter os nomes das ferramentas
+        let suggestedToolNames: string[] = [];
+        if (llmResponse && typeof llmResponse === 'string') {
+          suggestedToolNames = llmResponse.split(',').map(s => s.trim()).filter(Boolean);
+        }
+        // Filtra as ferramentas sugeridas
+        const relevantTools = allTools.tools.filter((t: any) => suggestedToolNames.includes(t.name));
+        if (relevantTools.length > 0) {
+          mcpTools = {
+            tools: relevantTools,
+            metadata: {
+              timestamp: new Date().toISOString(),
+              requestId: crypto.randomUUID().toString(),
+              filtered: true,
+              originalCount: allTools.tools.length,
+              returnedCount: relevantTools.length,
+              reductionPercent: Math.round(((allTools.tools.length - relevantTools.length) / allTools.tools.length) * 100),
+              reason: 'contextual_llm_selection'
+            }
+          };
+          console.error(`[LOG][CHAT] [TOOL_SELECTION] LLM selected ${relevantTools.length} tools: ${relevantTools.map((t: any) => t.name).join(', ')}`);
+        } else {
+          // Se o LLM não sugeriu nada, envie array vazio de ferramentas
+          toolSelectionMethod = 'contextual_none';
+          mcpTools = {
+            tools: [],
+            metadata: {
+              timestamp: new Date().toISOString(),
+              requestId: crypto.randomUUID().toString(),
+              filtered: true,
+              originalCount: allTools.tools.length,
+              returnedCount: 0,
+              reductionPercent: 100,
+              reason: 'contextual_llm_none_suggested'
+            }
+          };
+          console.error('[LOG][CHAT] [TOOL_SELECTION] LLM did not suggest any tools, returning empty tool array');
+        }
       }
     } else {
       // Filtering disabled: always send all tools
-      console.error('[LOG][CHAT] Context filtering disabled, loading all tools');
+      toolSelectionMethod = 'all/unfiltered';
+      console.error('[LOG][CHAT] [TOOL_SELECTION] Method: all/unfiltered | Context filtering disabled, loading all tools');
       mcpTools = await dynamicToolClient.getTools({});
       console.error(`[LOG][CHAT] Loaded ${mcpTools.tools.length} tools (unfiltered)`);
     }
