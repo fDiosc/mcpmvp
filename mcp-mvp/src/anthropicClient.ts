@@ -16,11 +16,11 @@ const conversationStore: Map<string, { id: string, lastAccessed: Date }> = new M
 
 // Function to get or create conversation ID
 function getConversationId(sessionIdentifier: string): string {
-  // Clean up expired conversations (older than 5 minutes)
+  // Clean up expired conversations (older than 30 minutes)
   const now = new Date();
   for (const [key, data] of conversationStore.entries()) {
     const timeDiff = now.getTime() - data.lastAccessed.getTime();
-    if (timeDiff > 5 * 60 * 1000) { // 5 minutes in milliseconds
+    if (timeDiff > 30 * 60 * 1000) { // 30 minutes in milliseconds
       console.log(`[LOG][ANTHROPIC] Removing expired conversation: ${key}`);
       conversationStore.delete(key);
     }
@@ -41,6 +41,9 @@ function getConversationId(sessionIdentifier: string): string {
   return conversation.id;
 }
 
+// Add the CustomAnthropicMessageRole type definition above the custom types
+type CustomAnthropicMessageRole = 'user' | 'assistant';
+
 // Define custom types for working with Anthropic's API
 export interface CustomContentBlock {
   type: "text" | "tool_use" | "tool_result";
@@ -54,7 +57,7 @@ export interface CustomContentBlock {
 }
 
 export interface CustomAnthropicMessage {
-  role: "user" | "assistant";
+  role: CustomAnthropicMessageRole;
   content: string | CustomContentBlock[];
 }
 
@@ -68,101 +71,121 @@ export interface CustomToolDefinition {
   };
 }
 
-// Main function to call Claude API with messages and tools
-export async function callClaudeDirectAPI(messages: CustomAnthropicMessage[], tools: CustomToolDefinition[], sessionId?: string) {
+/**
+ * Calls the Claude API directly
+ * @param messages The messages to send to Claude
+ * @param tools The tools available to Claude
+ * @param sessionId The session ID for tracking
+ * @param systemPrompt Optional system prompt to pass as a top-level parameter
+ */
+export async function callClaudeDirectAPI(
+  messages: any[], 
+  tools: any[] = [], 
+  sessionId: string = 'default-session',
+  systemPrompt?: string
+): Promise<any> {
   try {
-    console.log('[LOG][ANTHROPIC] Calling Claude API with messages and tools');
+    console.error('[LOG][ANTHROPIC] Calling Claude API with messages and tools');
     
     // Generate a session ID if not provided
     const currentSessionId = sessionId || 'default-session';
     const conversationId = getConversationId(currentSessionId);
     
-    // Apply cache control to messages - but limit to respect the 4 block maximum
-    const messagesWithCaching = applyPromptCaching(messages);
-    
-    // Log token count estimate
-    const estimatedTokens = estimateTokenCount(messagesWithCaching, tools);
-    console.log(`[LOG][CACHE] Estimated input tokens: ~${estimatedTokens} (min cacheable threshold: 2048)`);
-    
-    // Convert our custom types to Anthropic SDK types
-    const formattedMessages: MessageParam[] = messagesWithCaching.map(msg => {
+    // Convert our messages to a simpler format that's compatible with the Anthropic API
+    const formattedMessages: MessageParam[] = messages.map((msg: any) => {
+      // Handle string content
       if (typeof msg.content === 'string') {
         return {
           role: msg.role,
           content: msg.content
         };
-      } else {
+      }
+      
+      // Handle array content (blocks)
+      if (Array.isArray(msg.content)) {
         return {
           role: msg.role,
-          content: msg.content.map(block => {
+          content: msg.content.map((block: any) => {
             if (block.type === 'text') {
-              // Include cache_control if present
-              const baseBlock = {
-                type: 'text',
+              return {
+                type: 'text' as const,
                 text: block.text || ''
               };
-              
-              if (block.cache_control) {
-                return {
-                  ...baseBlock,
-                  cache_control: block.cache_control
-                };
-              }
-              
-              return baseBlock;
-            } else if (block.type === 'tool_use') {
+            }
+            if (block.type === 'tool_use') {
               return {
-                type: 'tool_use',
-                id: block.id || block.tool_use_id || uuidv4(),
+                type: 'tool_use' as const,
+                id: block.id || uuidv4(),
                 name: block.name || '',
                 input: block.input || {}
               };
-            } else if (block.type === 'tool_result') {
+            }
+            if (block.type === 'tool_result') {
               return {
-                type: 'tool_result',
-                tool_use_id: block.tool_use_id || block.id || '',
+                type: 'tool_result' as const,
+                tool_use_id: block.tool_use_id || '',
                 content: block.content || ''
               };
             }
+            
             // Default fallback
             return {
-              type: 'text',
+              type: 'text' as const,
               text: JSON.stringify(block)
             };
-          }) as ContentBlockParam[]
+          })
         };
       }
+      
+      // Default fallback for unknown message formats
+      return {
+        role: msg.role,
+        content: 'Unknown message format'
+      };
     });
-
-    // Format tools WITHOUT cache_control
+    
+    // Apply cache control if needed
+    let messagesWithCaching = formattedMessages;
+    messagesWithCaching = applyPromptCaching(formattedMessages);
+    
+    // Convert tools to the expected format
     const formattedTools = tools.map(tool => ({
-      name: tool.name,
-      description: tool.description,
+      name: tool.name || '',
+      description: tool.description || '',
       input_schema: {
         type: "object",
-        properties: tool.input_schema.properties || {},
-        required: tool.input_schema.required || []
+        properties: tool.input_schema?.properties || {},
+        required: tool.input_schema?.required || []
       }
     }));
     
-    // Make API call with caching enabled - use options parameter for headers
-    const response = await anthropic.messages.create({
-      model: "claude-3-5-haiku-20241022",
-      max_tokens: 1024,
-      messages: formattedMessages,
-      tools: formattedTools as any,
-      temperature: 0.7,
-    }, {
-      headers: {
-        "anthropic-beta": "prompt-caching-2024-07-31",
-        "anthropic-conversation-id": conversationId
+    // Log token count estimate (simplified)
+    const inputJson = JSON.stringify(messagesWithCaching) + JSON.stringify(formattedTools);
+    const estimatedTokens = Math.ceil(inputJson.length / 4); // Very rough estimate
+    console.error(`[LOG][CACHE] Estimated input tokens: ~${estimatedTokens} (min cacheable threshold: 2048)`);
+    
+    // Make API call with type assertions to ensure compatibility
+    const response = await anthropic.messages.create(
+      {
+        model: "claude-3-5-haiku-20241022",
+        max_tokens: 1024,
+        messages: messagesWithCaching,
+        ...(systemPrompt ? { system: systemPrompt } : {}),
+        tools: formattedTools as any,
+        temperature: 0.7
+      },
+      {
+        headers: {
+          "anthropic-beta": "prompt-caching-2024-07-31",
+          "anthropic-conversation-id": conversationId
+        }
       }
-    });
+    );
     
     // Log token usage and cache effectiveness
     logTokenUsage(response);
     
-    console.log('[LOG][ANTHROPIC] Claude API response received');
+    console.error('[LOG][ANTHROPIC] Claude API response received');
     return response;
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -251,7 +274,7 @@ function logTokenUsage(response: any) {
 }
 
 // Function to apply prompt caching to messages
-function applyPromptCaching(messages: CustomAnthropicMessage[]): CustomAnthropicMessage[] {
+function applyPromptCaching(messages: MessageParam[]): MessageParam[] {
   if (messages.length <= 1) {
     return messages;
   }
@@ -276,11 +299,13 @@ function applyPromptCaching(messages: CustomAnthropicMessage[]): CustomAnthropic
       }];
       cacheControlCount++;
     } else if (Array.isArray(result[0].content)) {
-      result[0].content[0] = {
-        ...result[0].content[0],
-        cache_control: { type: "ephemeral" }
-      };
-      cacheControlCount++;
+      if (result[0].content.length > 0) {
+        result[0].content[0] = {
+          ...result[0].content[0],
+          cache_control: { type: "ephemeral" }
+        };
+        cacheControlCount++;
+      }
     }
   }
   
@@ -296,21 +321,23 @@ function applyPromptCaching(messages: CustomAnthropicMessage[]): CustomAnthropic
         }];
         cacheControlCount++;
       } else if (Array.isArray(result[middleIndex].content)) {
-        result[middleIndex].content[0] = {
-          ...result[middleIndex].content[0],
-          cache_control: { type: "ephemeral" }
-        };
-        cacheControlCount++;
+        if (result[middleIndex].content.length > 0) {
+          result[middleIndex].content[0] = {
+            ...result[middleIndex].content[0],
+            cache_control: { type: "ephemeral" }
+          };
+          cacheControlCount++;
+        }
       }
     }
   }
   
   // 3. Apply cache control to second-to-last user message (if we have room)
   if (cacheControlCount < 4) {
-    const lastUserMsgIndex = findLastIndex(result, (msg: CustomAnthropicMessage) => msg.role === 'user');
+    const lastUserMsgIndex = findLastIndex(result, (msg: any) => msg.role === 'user');
     const secondToLastUserMsgIndex = findLastIndex(
       result.slice(0, lastUserMsgIndex), 
-      (msg: CustomAnthropicMessage) => msg.role === 'user'
+      (msg: any) => msg.role === 'user'
     );
     
     // If we have at least two user messages, add cache control to the second-to-last one
@@ -338,7 +365,7 @@ function applyPromptCaching(messages: CustomAnthropicMessage[]): CustomAnthropic
   
   // 4. Apply cache to latest user message if we still have quota
   if (cacheControlCount < 4) {
-    const lastUserMsgIndex = findLastIndex(result, (msg: CustomAnthropicMessage) => msg.role === 'user');
+    const lastUserMsgIndex = findLastIndex(result, (msg: any) => msg.role === 'user');
     if (lastUserMsgIndex >= 0) {
       if (typeof result[lastUserMsgIndex].content === 'string') {
         result[lastUserMsgIndex].content = [{ 
@@ -349,16 +376,18 @@ function applyPromptCaching(messages: CustomAnthropicMessage[]): CustomAnthropic
         cacheControlCount++;
       } else if (Array.isArray(result[lastUserMsgIndex].content)) {
         // Only apply if not already applied
-        const hasCache = result[lastUserMsgIndex].content.some(
-          (block: any) => block.cache_control && block.cache_control.type === 'ephemeral'
-        );
-        
-        if (!hasCache && result[lastUserMsgIndex].content.length > 0) {
-          result[lastUserMsgIndex].content[0] = {
-            ...result[lastUserMsgIndex].content[0],
-            cache_control: { type: "ephemeral" }
-          };
-          cacheControlCount++;
+        if (result[lastUserMsgIndex].content.length > 0) {
+          const hasCache = result[lastUserMsgIndex].content.some(
+            (block: any) => block.cache_control && block.cache_control.type === 'ephemeral'
+          );
+          
+          if (!hasCache) {
+            result[lastUserMsgIndex].content[0] = {
+              ...result[lastUserMsgIndex].content[0],
+              cache_control: { type: "ephemeral" }
+            };
+            cacheControlCount++;
+          }
         }
       }
     }
@@ -475,103 +504,100 @@ export function convertMcpToolsToAnthropicFormat(mcpTools: any[]): CustomToolDef
 }
 
 // Function to convert plain text messages to properly formatted Anthropic messages
-export function formatMessagesForAnthropic(messages: any[]): CustomAnthropicMessage[] {
-  return messages.map(msg => {
-    // Case 1: If it's already in the correct format with content array, use it directly
-    if (typeof msg === 'object' && msg.role && Array.isArray(msg.content) &&
-        msg.content.every((item: any) => typeof item === 'object' && item.type)) {
+export function formatMessagesForAnthropic(messages: any[]): { messages: CustomAnthropicMessage[], system?: string } {
+  // Primeiro, filtra mensagens vazias ou inválidas
+  const validMessages = messages.filter(msg => {
+    // Verifica se a mensagem tem role e content
+    if (!msg || typeof msg !== 'object' || !msg.role) {
+      return false;
+    }
+    
+    // Verifica strings vazias no content
+    if (typeof msg.content === 'string') {
+      return msg.content.trim() !== '';
+    }
+    
+    // Verifica arrays vazios no content
+    if (Array.isArray(msg.content)) {
+      if (msg.content.length === 0) return false;
       
-      // Fix any tool_use blocks that might be using tool_use_id instead of id
-      if (msg.content.some((item: any) => item.type === 'tool_use')) {
-        return {
-          role: msg.role,
-          content: msg.content.map((item: any) => {
-            if (item.type === 'tool_use') {
-              return {
-                type: 'tool_use',
-                id: item.id || item.tool_use_id || uuidv4(),
-                name: item.name || '',
-                input: item.input || {}
-              };
-            } else if (item.type === 'tool_result') {
-              return {
-                type: 'tool_result',
-                tool_use_id: item.tool_use_id || item.id || '',
-                content: item.content || ''
-              };
-            }
-            return item;
-          })
-        };
+      // Verifica cada item do array de content
+      return msg.content.some((item: any) => {
+        if (item && item.type === 'text') {
+          return item.text && item.text.trim() !== '';
+        }
+        return false;
+      });
+    }
+    
+    // Verifica objetos de content
+    if (msg.content && typeof msg.content === 'object') {
+      if (msg.content.type === 'text') {
+        return msg.content.text && msg.content.text.trim() !== '';
       }
-      
-      return msg;
     }
     
-    // Case 2: If it has content as a string
-    if (typeof msg === 'object' && msg.role && typeof msg.content === 'string') {
-      return {
-        role: msg.role,
-        content: [{ type: 'text', text: msg.content }]
-      };
-    }
-    
-    // Case 3: If it has content with nested text property (handle malformed content)
-    if (typeof msg === 'object' && msg.role && 
-        Array.isArray(msg.content) && 
-        msg.content[0] && 
-        msg.content[0].text && 
-        typeof msg.content[0].text === 'object') {
-      // Fix the nested text object
-      return {
-        role: msg.role,
-        content: msg.content.map((item: any) => {
-          if (item.text && typeof item.text === 'object' && item.text.text) {
-            return {
-              type: 'text',
-              text: item.text.text
-            };
-          }
-          return item;
-        })
-      };
-    }
-    
-    // Case 4: Handle content with type but missing text or incorrect property structure
-    if (typeof msg === 'object' && msg.role && 
-        Array.isArray(msg.content) && 
-        msg.content.some((item: any) => item.type === 'text' || item.type === 'tool_use' || item.type === 'tool_result')) {
-      return {
-        role: msg.role,
-        content: msg.content.map((item: any) => {
-          if (item.type === 'text') {
-            return {
-              type: 'text',
-              text: typeof item.text === 'string' ? item.text : JSON.stringify(item.text || '')
-            };
-          } else if (item.type === 'tool_use') {
-            return {
-              type: 'tool_use',
-              id: item.id || item.tool_use_id || uuidv4(),
-              name: item.name || '',
-              input: item.input || {}
-            };
-          } else if (item.type === 'tool_result') {
-            return {
-              type: 'tool_result',
-              tool_use_id: item.tool_use_id || item.id || '',
-              content: item.content || ''
-            };
-          }
-          return item;
-        })
-      };
-    }
-    
-    // Default case - create a simple message
-    return {
-      role: msg.role || 'user',
-      content: [{ type: 'text', text: typeof msg.content === 'string' ? msg.content : '' }]
-    };
+    return false;
   });
+
+  // Extrai mensagens do sistema (deve ser passada como parâmetro de nível superior)
+  let systemContent: string | undefined;
+  const nonSystemMessages: CustomAnthropicMessage[] = [];
+
+  for (const msg of validMessages) {
+    if (msg.role === 'system') {
+      // Extrair conteúdo do sistema
+      if (typeof msg.content === 'string') {
+        systemContent = msg.content;
+      } else if (Array.isArray(msg.content)) {
+        // Pega apenas o texto dos objetos de conteúdo
+        const textParts = msg.content
+          .filter((item: any) => item && item.type === 'text' && item.text)
+          .map((item: any) => item.text);
+        if (textParts.length > 0) {
+          systemContent = textParts.join('\n');
+        }
+      } else if (msg.content && msg.content.type === 'text') {
+        systemContent = msg.content.text;
+      }
+    } else {
+      // Processar mensagens não-sistema
+      if (typeof msg.content === 'string') {
+        nonSystemMessages.push({
+          role: msg.role as CustomAnthropicMessageRole,
+          content: [{
+            type: 'text',
+            text: msg.content
+          }]
+        });
+      } else if (Array.isArray(msg.content)) {
+        const contents = msg.content
+          .filter((item: any) => item && item.type === 'text' && item.text)
+          .map((item: any) => ({
+            type: 'text' as const,
+            text: item.text
+          }));
+        
+        if (contents.length > 0) {
+          nonSystemMessages.push({
+            role: msg.role as CustomAnthropicMessageRole,
+            content: contents
+          });
+        }
+      } else if (msg.content && msg.content.type === 'text') {
+        nonSystemMessages.push({
+          role: msg.role as CustomAnthropicMessageRole,
+          content: [{
+            type: 'text',
+            text: msg.content.text
+          }]
+        });
+      }
+    }
+  }
+
+  return {
+    messages: nonSystemMessages,
+    system: systemContent
+  };
 } 

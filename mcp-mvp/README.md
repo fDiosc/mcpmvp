@@ -8,6 +8,22 @@ This project implements a local Model Context Protocol (MCP) server that can be 
 
 ## Recent Updates
 
+**May 2024: Improved Claude Integration & Prompt Caching**
+
+- Added Anthropic prompt caching support for improved performance
+- Fixed conversation context persistence across multi-tool interactions
+- Enhanced error handling in tool execution flows
+- Optimized cache control for larger conversations
+
+**March 2024: Agentic Flow Architecture**
+
+- Implemented an emergent agentic architecture with specialized "agent" functions:
+  - Tool Selection Agent: Analyzes user queries to determine relevant tools
+  - Prompt Detection Agent: Identifies if special prompts should be applied
+  - Conversation Agent: Maintains the main conversation with selected tools
+- Each agent maintains its own conversation context and operates independently
+- Reduced token usage by only passing relevant tools to the main conversation
+
 **October 2023: Context-Based Tool Loading**
 
 - Implemented smart context detection from user messages
@@ -21,11 +37,69 @@ This project implements a local Model Context Protocol (MCP) server that can be 
 - Local MCP server with SSE transport
 - OpenAI assistants integration (using the official OpenAI SDK)
 - Claude integration via AWS Bedrock
-- Claude integration via direct Anthropic API
+- Claude integration via direct Anthropic API with prompt caching
 - Web interface for interacting with models
 - Note creation and listing
-- Jira issue retrieval
+- Jira issue retrieval and management
 - Dynamic tool discovery for reduced token usage
+- Agentic flow architecture for optimal context handling
+
+## Architecture
+
+The system implements a novel agentic architecture where:
+
+### Agent Components
+
+1. **Tool Selection Agent**
+   - Analyzes user queries using a separate LLM call
+   - Determines which tools are contextually relevant
+   - Maintains a separate conversation context to focus on tool relevance
+
+2. **Prompt Detection Agent**
+   - Evaluates if user messages match special prompts
+   - Helps format conversations for specific tasks
+   - Uses lightweight model calls to minimize token usage
+
+3. **Main Conversation Agent**
+   - Maintains the complete conversation history
+   - Uses only the tools selected by the Tool Selection Agent
+   - Handles tool execution and result incorporation
+   - Applies prompt caching for improved performance
+
+### Communication Flow
+
+```
+User Query
+   ↓
+┌─────────────────┐     ┌─────────────────┐
+│ Tool Selection  │     │ Prompt Detection│
+│     Agent       │     │     Agent       │
+└────────┬────────┘     └────────┬────────┘
+         │                       │
+         └─────────┬─────────────┘
+                   ↓
+         ┌─────────────────────┐
+         │  Main Conversation  │
+         │       Agent         │
+         └─────────┬───────────┘
+                   ↓
+         ┌─────────────────────┐
+         │     Tool Execution  │
+         │                     │
+         └─────────┬───────────┘
+                   ↓
+              User Response
+```
+
+### Claude Prompt Caching
+
+The system now leverages Anthropic's prompt caching feature to improve performance and reduce costs:
+
+- Cache control markers are strategically placed in conversations
+- Up to 4 cache control blocks are applied to optimize caching
+- Messages over 2048 tokens benefit from cache optimization
+- Conversation IDs are preserved to maintain cache validity
+- Detailed logs track cache creation/reading efficiency
 
 ## Setup
 
@@ -50,6 +124,7 @@ ANTHROPIC_API_KEY=your_anthropic_key
 JIRA_BASE_URL=your_jira_url
 JIRA_USERNAME=your_jira_username
 JIRA_API_TOKEN=your_jira_token
+ENABLE_CONTEXT_FILTERING=true
 ```
 
 ### Installation
@@ -80,7 +155,7 @@ The web interface provides:
 
 1. **OpenAI**: Uses OpenAI's assistants API with native thread management.
 2. **Claude (Bedrock)**: Uses Claude via AWS Bedrock, with history managed in browser.
-3. **Claude (API Direct)**: Uses Anthropic's API directly with improved tool handling.
+3. **Claude (API Direct)**: Uses Anthropic's API directly with improved tool handling and prompt caching.
 
 ### Supported Claude Models
 
@@ -136,32 +211,53 @@ The system automatically analyzes user messages to identify relevant contexts:
    const jiraTools = await dynamicClient.getTools({ context: 'jira' });
    ```
 
-4. **Testing**:
-   ```bash
-   # Run the TypeScript test
-   npm run test:dynamic-tools
-   
-   # View metrics
-   npm run tools:metrics
-   
-   # Reset metrics
-   npm run tools:reset-metrics
-   ```
+### Prompt Detection and Management
 
-### Benefits
+The system can detect when specialized prompts should be applied:
 
-- **Reduced Token Usage**: By only sending relevant tools to the model, token usage is significantly reduced
-- **Improved Response Time**: Models process requests faster with fewer tools
-- **Context-Aware Responses**: Tools are only presented when relevant to the user's intent
-- **Zero-Tool Mode**: When no context is detected, the model operates without tools, saving tokens
+```typescript
+import { DynamicPromptClient } from './client/dynamicPrompts.js';
 
-For complete implementation details, refer to the source code in `src/client/dynamicTools.ts` and the endpoint in `src/index.ts`.
+// Create a dynamic prompt client
+const promptClient = new DynamicPromptClient(mcpClient);
+
+// Detect if a message matches a specific prompt
+const promptResult = await promptClient.getPromptFromMessage(userMessage);
+if (promptResult) {
+  console.log(`Detected prompt: ${promptResult.promptName}`);
+  // Use the formatted prompt messages
+  const messages = promptResult.promptContent;
+}
+```
+
+### Anthropic Prompt Caching
+
+For conversations using the Claude API directly, the system implements prompt caching to improve performance:
+
+```typescript
+// API call with cache control headers
+const response = await anthropic.messages.create(
+  {
+    model: "claude-3-5-haiku-20241022",
+    messages: messagesWithCaching, // Messages with cache_control markers
+    temperature: 0.7
+  },
+  {
+    headers: {
+      "anthropic-beta": "prompt-caching-2024-07-31",
+      "anthropic-conversation-id": conversationId
+    }
+  }
+);
+```
 
 ## Troubleshooting
 
 - If you see "Modelo não suportado" errors, check that your API keys are set properly in the `.env` file.
 - If tool calls fail with Claude (Bedrock), try the Claude (API Direct) option which has improved handling of tool execution acknowledgments.
 - For direct Anthropic API, ensure you're using a valid model ID (see supported models above).
+- If caching isn't working properly, ensure conversations exceed the 2048 token minimum threshold.
+- For tool selection issues, check the logs for the Tool Selection Agent responses.
 
 ## Development
 

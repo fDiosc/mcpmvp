@@ -51,7 +51,21 @@ import fetch from 'node-fetch';
 import { callClaudeDirectAPI, handleToolExecution, convertMcpToolsToAnthropicFormat, formatMessagesForAnthropic } from './anthropicClient.js';
 import crypto from 'crypto';
 import { DynamicToolClient, extractContextFromMessage } from './client/dynamicTools.js';
+import { registerSummarizeNotesPrompt, registerToolSelectionPrompt, registerNewsletterPrompt, registerReleaseNotePrompt } from './prompts/index.js';
+import { DynamicPromptClient } from './client/dynamicPrompts.js';
+import { OpenAI } from "openai";
+import Anthropic from "@anthropic-ai/sdk";
 dotenv.config();
+
+// Instância do OpenAI para chamar a API
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY
+});
+
+// Instância do Anthropic para chamar a API
+const anthropic = new Anthropic({
+  apiKey: process.env.ANTHROPIC_API_KEY
+});
 
 /**
  * Type alias for a note object.
@@ -131,67 +145,11 @@ server.resource(
   }
 );
 
-// Prompt para sumarizar notas
-server.prompt(
-  "summarize_notes",
-  {},
-  async (_args, _extra) => {
-    const embeddedNotes = Object.entries(notes).map(([id, note]) => ({
-      role: "user" as const,
-      content: {
-        type: "resource" as const,
-        resource: {
-          uri: `note:///${id}`,
-          mimeType: "text/plain",
-          text: note.content
-        }
-      }
-    }));
-    
-    return {
-      messages: [
-        {
-          role: "user" as const,
-          content: {
-            type: "text" as const,
-            text: "Please summarize the following notes:"
-          }
-        },
-        ...embeddedNotes,
-        {
-          role: "user" as const,
-          content: {
-            type: "text" as const,
-            text: "Provide a concise summary of all the notes above."
-          }
-        }
-      ]
-    };
-  }
-);
-
-// Prompt MCP para seleção de ferramentas pelo LLM
-server.prompt(
-  "tool_selection",
-  {
-    userMessage: z.string().describe("Mensagem do usuário"),
-    toolsText: z.string().describe("Lista de ferramentas disponíveis em texto formatado")
-  },
-  async ({ userMessage, toolsText }: { userMessage: string, toolsText: string }, _extra: any) => {
-    const promptText = `\nUsuário enviou a seguinte mensagem:\n"${userMessage}"\n\nLista de ferramentas disponíveis:\n${toolsText}\n\nQuais ferramentas são relevantes para atender ao pedido do usuário?\nResponda apenas com uma lista de nomes de ferramentas, separados por vírgula.`;
-    return {
-      messages: [
-        {
-          role: "user" as const,
-          content: {
-            type: "text" as const,
-            text: promptText
-          }
-        }
-      ]
-    };
-  }
-);
+// Register prompts (moved to prompts module)
+registerSummarizeNotesPrompt(server, notes);
+registerToolSelectionPrompt(server);
+registerNewsletterPrompt(server);
+registerReleaseNotePrompt(server);
 
 // Existing Jira tool registration
 server.tool(
@@ -357,6 +315,22 @@ app.get('/notas', (req: Request, res: Response) => {
   res.json(Object.entries(notes).map(([id, note]) => ({ id, ...note })));
 });
 
+// Endpoint para listar notas
+app.get('/notas', (_req, res) => {
+  try {
+    const notasList = Object.entries(notes).map(([id, nota]) => ({
+      id,
+      title: nota.title,
+      content: nota.content
+    }));
+    
+    res.json(notasList);
+  } catch (err) {
+    console.error('Error listing notes:', err);
+    res.status(500).json({ error: 'Erro ao listar notas.' });
+  }
+});
+
 // Servir arquivos estáticos do diretório web
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -486,9 +460,39 @@ app.post('/chat', async (req: Request, res: Response) => {
     
     // Create dynamic tool client if not already created
     let dynamicToolClient = new DynamicToolClient(mcpClient);
+    // Create dynamic prompt client
+    let dynamicPromptClient = new DynamicPromptClient(mcpClient);
     let mcpTools;
     let toolSelectionMethod = '';
     const enableContextFiltering = process.env.ENABLE_CONTEXT_FILTERING === 'true';
+
+    // Verifica se temos um prompt específico a ser usado
+    let promptMessages = null;
+    let systemPrompt = null;
+
+    // Verificar se temos um prompt contextual usando o cliente de prompts dinâmicos
+    console.error('[LOG][CHAT] Checking for prompt context...');
+    const promptResult = await dynamicPromptClient.getPromptFromMessage(userInput);
+    
+    if (promptResult) {
+      console.error(`[LOG][CHAT] [PROMPT_SELECTION] Detected prompt: ${promptResult.promptName}`);
+      systemPrompt = promptResult.system;
+      promptMessages = [
+        ...(promptResult.promptContent || []),
+        { 
+          role: 'user',
+          content: [{
+            type: 'text',
+            text: userInput
+          }]
+        }
+      ];
+      console.error('[LOG][DYNAMIC_PROMPT] Formatted messages:', JSON.stringify(promptMessages));
+    } else {
+      console.error('[LOG][CHAT] No specific prompt context detected, proceeding with normal flow');
+    }
+
+    // PASSO 2: Detecção de Contexto para Tools
     if (enableContextFiltering) {
       // 1. Tenta keyword mapping
       console.error('[LOG][CHAT] Analyzing user input for context detection (keyword mapping)...');
@@ -611,7 +615,73 @@ app.post('/chat', async (req: Request, res: Response) => {
       }
       
       try {
-        const response = await sendMessage(mcpClient, thread.id, assistant.id, userInput);
+        let response;
+        if (promptMessages) {
+          // Se temos um prompt detectado, usamos ele
+          console.error('[LOG][CHAT] Using detected prompt for OpenAI...');
+          
+          // Enviamos cada mensagem do prompt para o thread
+          for (const promptMessage of promptMessages) {
+            const role = promptMessage.role || 'user';
+            let content = '';
+            
+            if (typeof promptMessage.content === 'string') {
+              content = promptMessage.content;
+            } else if (promptMessage.content.type === 'text') {
+              content = promptMessage.content.text;
+            } else {
+              // Para outros tipos de conteúdo, convertemos para string
+              content = JSON.stringify(promptMessage.content);
+            }
+            
+            await openai.beta.threads.messages.create(thread.id, {
+              role: role as any,
+              content: content
+            });
+          }
+          
+          // Executamos o assistente no thread
+          const run = await openai.beta.threads.runs.create(thread.id, {
+            assistant_id: assistant.id
+          });
+          
+          // Aguardamos a conclusão
+          let completed = false;
+          let runResult;
+          
+          while (!completed) {
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            runResult = await openai.beta.threads.runs.retrieve(thread.id, run.id);
+            
+            if (runResult.status === 'completed' || 
+                runResult.status === 'failed' || 
+                runResult.status === 'cancelled') {
+              completed = true;
+            }
+          }
+          
+          // Obtemos as mensagens mais recentes
+          const messages = await openai.beta.threads.messages.list(thread.id, {
+            order: 'desc',
+            limit: 1
+          });
+          
+          if (messages.data.length > 0) {
+            const latestMessage = messages.data[0];
+            if (latestMessage.content && latestMessage.content.length > 0) {
+              const content = latestMessage.content[0];
+              if (content.type === 'text') {
+                response = content.text.value;
+              } else {
+                response = JSON.stringify(content);
+              }
+            }
+          }
+        } else {
+          // Fluxo normal sem prompt
+          response = await sendMessage(mcpClient, thread.id, assistant.id, userInput);
+        }
+        
         console.error('[LOG][CHAT] OpenAI response received');
         res.json({ response });
       } catch (err) {
@@ -620,11 +690,36 @@ app.post('/chat', async (req: Request, res: Response) => {
       }
     } else if (selectedModel === 'bedrock') {
       // Bedrock Claude flow: use history from frontend if provided
-      let messages = Array.isArray(req.body.history) ? req.body.history.slice() : [{ role: "user", content: userInput }];
+      let messages = Array.isArray(req.body.history) ? req.body.history.slice() : [];
+      
+      // Se detectamos um prompt, usamos ele
+      if (promptMessages) {
+        console.error('[LOG][CHAT] Using detected prompt for Bedrock Claude...');
+        
+        // Converte as mensagens do prompt para o formato esperado pelo Bedrock
+        messages = promptMessages.map(pm => {
+          if (typeof pm.content === 'string') {
+            return { role: pm.role, content: pm.content };
+          } else if (pm.content.type === 'text') {
+            return { role: pm.role, content: pm.content.text };
+          } else {
+            // Para outros tipos de conteúdo, convertemos para string
+            return { role: pm.role, content: JSON.stringify(pm.content) };
+          }
+        });
+      } else if (messages.length === 0) {
+        // Se não temos histórico nem prompt, usamos apenas a mensagem do usuário
+        messages = [{ role: "user", content: userInput }];
+      } else if (messages.length > 0 && messages[messages.length - 1].role !== 'user') {
+        // Se a última mensagem no histórico não é do usuário, adicionamos a atual
+        messages.push({ role: "user", content: userInput });
+      }
+      
       let recursion = 0;
       const MAX_RECURSION = 5;
       let finished = false;
       let finalTexts: string[] = [];
+      
       while (!finished && recursion < MAX_RECURSION) {
         let response;
         try {
@@ -641,6 +736,7 @@ app.post('/chat', async (req: Request, res: Response) => {
           res.status(500).json({ error: 'Erro ao chamar Claude (Bedrock).' });
           return;
         }
+        
         finished = true;
         if (response.type === "message" && Array.isArray(response.content)) {
           for (const block of response.content) {
@@ -694,124 +790,131 @@ app.post('/chat', async (req: Request, res: Response) => {
       console.error('[LOG][CHAT] Final response to frontend:', finalText);
       res.json({ response: finalText });
     } else if (selectedModel === 'anthropic') {
-      // Direct Anthropic API flow
+      // Claude via API direta da Anthropic
       console.error('[LOG][CHAT] Using direct Anthropic API integration');
       
-      // Format messages for Anthropic API
-      let messageHistory = Array.isArray(req.body.history) 
-        ? formatMessagesForAnthropic(req.body.history) 
-        : [];
+      // A mensagem a ser enviada depende se detectamos um prompt ou não
+      let userMessage = { 
+        role: 'user' as const, 
+        content: [{ 
+          type: 'text' as const, 
+          text: userInput 
+        }]
+      };
       
-      // Add current user message if not already in history
-      if (messageHistory.length === 0 || 
-          messageHistory[messageHistory.length - 1].role !== 'user' ||
-          ((messageHistory[messageHistory.length - 1].content as any)[0]?.text !== userInput)) {
-        messageHistory.push({
-          role: 'user',
-          content: [{ type: 'text', text: userInput }]
-        });
+      let messages = [];
+      if (promptMessages) {
+        console.error('[LOG][CHAT] Using detected prompt for Anthropic API');
+        messages = promptMessages;
+      } else {
+        // Apenas a mensagem do usuário
+        messages = [userMessage];
       }
       
-      // Convert MCP tools to Anthropic format
+      // Se o histórico foi fornecido, incorpore-o
+      const providedHistory = req.body.history || [];
+      if (providedHistory && Array.isArray(providedHistory) && providedHistory.length > 0) {
+        // Use apenas o histórico existente se não for a primeira mensagem
+        if (messages.length === 1 && messages[0].role === 'user') {
+          // Insira o histórico antes da mensagem atual
+          messages = [...providedHistory, ...messages];
+          console.error(`[LOG][CHAT] Incorporated ${providedHistory.length} message(s) from history`);
+        }
+      }
+      
+      // Log das mensagens formatadas para depuração
+      console.error('[LOG][CHAT] Anthropic messages:', JSON.stringify(messages));
+      
+      const clientId = req.body.sessionId || `${req.ip}-${req.headers['user-agent']}`;
+      
+      // Transforma as ferramentas MCP para o formato Anthropic
       const anthropicTools = convertMcpToolsToAnthropicFormat(mcpTools.tools);
       
-      // Create a unique session identifier based on client IP and user agent
-      const clientIp = req.ip || '127.0.0.1';
-      const userAgent = req.get('user-agent') || 'unknown';
-      const sessionIdentifier = `${clientIp}-${userAgent}`;
-      
       try {
-        // Process multi-turn conversation with tool calls
-        let isToolCallPending = true;
-        let recursionCount = 0;
-        const MAX_RECURSIONS = 5;
-        let responseText = '';
+        // Chama a API da Anthropic usando o helper existente
+        let response = await callClaudeDirectAPI(
+          messages, 
+          anthropicTools, 
+          clientId,
+          systemPrompt as string | undefined
+        );
+        console.error('[LOG][CHAT] Anthropic API response received');
         
-        // Keep processing tool calls until complete or max recursions reached
-        while (isToolCallPending && recursionCount < MAX_RECURSIONS) {
-          console.error(`[LOG][ANTHROPIC] Processing turn ${recursionCount + 1}, message history length: ${messageHistory.length}`);
+        // Verificar se temos uma execução de ferramenta a realizar
+        if (response.stop_reason === 'tool_use' && response.content) {
+          console.error('[LOG][TOOLS] Tool use detected, initiating tool execution flow');
           
-          // Log context analysis results if filtering is enabled
-          if (process.env.ENABLE_CONTEXT_FILTERING === 'true') {
-            const lastUserMessage = messageHistory
-              .filter(msg => msg.role === 'user')
-              .pop();
+          // Encontrar o bloco tool_use
+          const toolUseBlock = response.content.find((block: any) => block.type === 'tool_use');
+          if (toolUseBlock) {
+            console.error(`[LOG][TOOLS] Tool to execute: ${toolUseBlock.name}`);
             
-            if (lastUserMessage && Array.isArray(lastUserMessage.content)) {
-              const textContent = lastUserMessage.content
-                .filter(content => content.type === 'text')
-                .map(content => content.text)
-                .join(' ');
-              
-              if (textContent) {
-                const contexts = extractContextFromMessage(textContent);
-                console.error(`[LOG][CONTEXT] Extracted contexts: ${contexts.join(', ') || 'none'}`);
-              }
-            }
-          }
-          
-          // Call Anthropic API with session identifier
-          const claudeResponse = await callClaudeDirectAPI(messageHistory, anthropicTools, sessionIdentifier);
-          
-          // Extract text response
-          const textContents = claudeResponse.content
-            .filter((item: any) => item.type === 'text')
-            .map((item: any) => {
-              // Explicitly check and handle the item type
-              if (item.type === 'text' && typeof item.text === 'string') {
-                return item.text;
-              }
-              return '';
-            });
-          
-          if (textContents.length > 0) {
-            responseText = textContents.join('\n');
-          }
-          
-          // Check for tool use
-          const toolUse = claudeResponse.content.find(
-            (item: any) => item.type === 'tool_use'
-          );
-          
-          if (toolUse) {
-            console.error('[LOG][ANTHROPIC] Tool use detected:', toolUse);
-            // Make sure we pass the complete toolUse object, preserving the id
-            // Execute the tool
+            // Cria uma função para executar a ferramenta usando o servidor MCP
             const executeTool = async (name: string, args: any) => {
-              return await mcpClient.callTool({ name, arguments: args });
+              console.error(`[LOG][TOOLS] Executing tool: ${name} with args:`, args);
+              try {
+                // Encontra a ferramenta por nome
+                const tool = mcpTools.tools.find((t: any) => t.name === name);
+                if (!tool) {
+                  throw new Error(`Tool not found: ${name}`);
+                }
+                
+                // Executa a ferramenta usando o cliente MCP
+                const result = await mcpClient.callTool({ name, arguments: args });
+                console.error(`[LOG][TOOLS] Tool execution result:`, result);
+                return result;
+              } catch (error) {
+                console.error(`[ERROR][TOOLS] Error executing tool ${name}:`, error);
+                throw error;
+              }
             };
             
-            // Handle tool execution with proper message formatting
-            const { messageHistory: updatedHistory } = await handleToolExecution(
-              toolUse,
+            // Usa handleToolExecution para executar a ferramenta e atualizar o histórico
+            const { messageHistory } = await handleToolExecution(
+              toolUseBlock,
               executeTool,
-              messageHistory
+              JSON.parse(JSON.stringify(messages)) // Deep copy para evitar mutações
             );
             
-            // Update message history
-            messageHistory = updatedHistory;
-            isToolCallPending = true;
-            recursionCount++;
-          } else {
-            // No more tool calls, we're done
-            isToolCallPending = false;
+            // Continua a conversa com o resultado da ferramenta
+            console.error(`[LOG][CHAT] Continuing conversation with tool result, history length: ${messageHistory.length}`);
+            response = await callClaudeDirectAPI(
+              messageHistory,
+              anthropicTools,
+              clientId,
+              systemPrompt as string | undefined
+            );
             
-            // Add final assistant response to history
-            if (textContents.length > 0) {
-              messageHistory.push({
-                role: 'assistant',
-                content: [{ type: 'text', text: responseText }]
-              });
-            }
+            // Atualiza o histórico para a próxima iteração
+            messages = messageHistory;
           }
         }
         
-        console.error('[LOG][ANTHROPIC] Final response:', responseText);
+        // Processa o histórico para retornar ao cliente
+        const history = [...messages]; // Começa com o histórico existente
+        
+        // Extrai a resposta de texto
+        let responseText = '';
+        if (response && response.content && Array.isArray(response.content)) {
+          const textBlocks = response.content.filter((block: any) => block.type === 'text');
+          if (textBlocks.length > 0) {
+            responseText = textBlocks.map((block: any) => block.text).join('\n');
+          }
+        }
+        
+        // Adiciona a resposta do assistente ao histórico (somente se não for ferramenta)
+        if (responseText) {
+          history.push({
+            role: 'assistant',
+            content: responseText
+          });
+        }
+        
+        // Retorna a resposta com o histórico atualizado
         res.json({ 
           response: responseText,
-          history: messageHistory // Return updated history for frontend to store
+          history: history
         });
-        
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : 'Unknown error';
         console.error('[ERROR][ANTHROPIC] Error processing chat:', errorMessage);
@@ -1022,6 +1125,136 @@ app.get('/tools/metrics', (req: Request, res: Response) => {
 app.post('/tools/metrics/reset', (req: Request, res: Response) => {
   toolMetrics.resetMetrics();
   res.json({ message: 'Metrics reset successfully' });
+});
+
+// Adicione o endpoint após o handler de '/chat'
+app.get('/prompts/list', async (_req, res) => {
+  try {
+    // CORREÇÃO: Não usar mcpClient.prompts().list() porque a API pode não existir
+    // Em vez disso, definir os prompts manualmente
+    const formattedPrompts = [
+      { 
+        name: 'summarize_notes', 
+        description: 'Resumir todas as notas do sistema',
+        arguments: []
+      },
+      { 
+        name: 'newsletter_post', 
+        description: 'Criar um post de newsletter sobre novos recursos',
+        arguments: [
+          { name: 'feature', description: 'Description of the new feature' },
+          { name: 'context', description: 'Additional context or target audience for the newsletter' }
+        ]
+      },
+      { 
+        name: 'release_note', 
+        description: 'Criar uma nota de lançamento para uma versão',
+        arguments: [
+          { name: 'summary', description: 'Summary of the release or feature' },
+          { name: 'details', description: 'Additional details, bug fixes, improvements, etc.' }
+        ]
+      },
+      { 
+        name: 'tool_selection', 
+        description: 'Selecionar ferramentas adequadas para uma tarefa',
+        arguments: [
+          { name: 'userMessage', description: 'Mensagem do usuário' },
+          { name: 'toolsText', description: 'Lista de ferramentas disponíveis em texto formatado' }
+        ]
+      }
+    ];
+    
+    console.error('[LOG][PROMPTS] Serving hardcoded prompts list');
+    res.json(formattedPrompts);
+  } catch (err) {
+    console.error('Error listing prompts:', err);
+    res.status(500).json({ error: 'Erro ao listar prompts disponíveis.' });
+  }
+});
+
+// Endpoint para obter e verificar um prompt específico
+app.get('/prompts/:name', async (req, res) => {
+  try {
+    const promptName = req.params.name;
+    const params = req.query;
+    
+    // Remove o tipo de qualquer parâmetro
+    const cleanParams: Record<string, any> = {};
+    Object.entries(params).forEach(([key, value]) => {
+      cleanParams[key] = value;
+    });
+    
+    console.error(`[LOG][PROMPTS] Getting prompt "${promptName}" with params:`, cleanParams);
+    
+    // CORREÇÃO: Implementação manual para cada tipo de prompt
+    let promptResult;
+    if (promptName === 'newsletter_post') {
+      const feature = cleanParams.feature || 'Unnamed feature';
+      const context = cleanParams.context || '';
+      
+      promptResult = {
+        messages: [
+          {
+            role: "user",
+            content: {
+              type: "text",
+              text: `\nA new feature has been developed: "${feature}".\n${context ? `Context: ${context}` : ""}\nWrite a newsletter post announcing this feature. The post should be engaging, clear, and suitable for our audience.`
+            }
+          }
+        ]
+      };
+    } else if (promptName === 'release_note') {
+      const summary = cleanParams.summary || 'Unnamed release';
+      const details = cleanParams.details || '';
+      
+      promptResult = {
+        messages: [
+          {
+            role: "user",
+            content: {
+              type: "text",
+              text: `\nRelease Note:\nSummary: "${summary}"\n${details ? `Details: ${details}` : ""}\nWrite a clear and concise release note for this update. Use a professional tone and highlight the most important changes.`
+            }
+          }
+        ]
+      };
+    } else if (promptName === 'summarize_notes') {
+      promptResult = {
+        messages: [
+          {
+            role: "user",
+            content: {
+              type: "text",
+              text: "Please summarize all the notes in the system."
+            }
+          }
+        ]
+      };
+    } else if (promptName === 'tool_selection') {
+      const userMessage = cleanParams.userMessage || '';
+      const toolsText = cleanParams.toolsText || '';
+      
+      promptResult = {
+        messages: [
+          {
+            role: "user",
+            content: {
+              type: "text",
+              text: `\nUsuário enviou a seguinte mensagem:\n"${userMessage}"\n\nLista de ferramentas disponíveis:\n${toolsText}\n\nQuais ferramentas são relevantes para atender ao pedido do usuário?\nResponda apenas com uma lista de nomes de ferramentas, separados por vírgula.`
+            }
+          }
+        ]
+      };
+    } else {
+      throw new Error(`Prompt "${promptName}" não encontrado`);
+    }
+    
+    console.error(`[LOG][PROMPTS] Serving hardcoded prompt "${promptName}"`);
+    res.json(promptResult);
+  } catch (err) {
+    console.error('Error getting prompt:', err);
+    res.status(500).json({ error: 'Erro ao obter prompt.' });
+  }
 });
 
 const port = 3333;

@@ -12,6 +12,9 @@
     .bot { color: #388e3c; }
     #model-selector { margin-right: 10px; padding: 5px; }
     .loading-indicator { color: #888; font-style: italic; }
+    #available-prompts { border: 1px solid #ccc; padding: 1em; margin-top: 2em; }
+    .prompt-btn { margin: 5px; padding: 5px 10px; cursor: pointer; }
+    .prompt-info { font-size: 0.8em; color: #666; margin-top: 5px; }
   </style>
 </head>
 <body>
@@ -27,6 +30,14 @@
     <button type="submit">Enviar</button>
   </form>
 
+  <div id="available-prompts">
+    <h2>Prompts Disponíveis</h2>
+    <div id="prompt-buttons"></div>
+    <p class="prompt-info">Os prompts acima são sistemas de mensagens pré-definidas para facilitar tarefas específicas. 
+    Peça por eles diretamente, como "Crie uma newsletter sobre a nova funcionalidade" ou 
+    "Gere uma nota de lançamento para a versão 2.0".</p>
+  </div>
+
   <div id="notas">
     <h2>Notas Criadas</h2>
     <ul id="lista-notas"></ul>
@@ -38,6 +49,7 @@
     const form = document.getElementById('form');
     const input = document.getElementById('input');
     const listaNotas = document.getElementById('lista-notas');
+    const promptButtons = document.getElementById('prompt-buttons');
     let messageHistory = [];
     let anthropicHistory = []; // Separate history for Anthropic API
 
@@ -124,6 +136,61 @@
       this.setAttribute('data-last-value', this.value);
     });
 
+    // Carregar prompts disponíveis
+    async function carregarPrompts() {
+      try {
+        const res = await fetch('/prompts/list');
+        const prompts = await res.json();
+        
+        promptButtons.innerHTML = '';
+        
+        if (prompts.length === 0) {
+          promptButtons.innerHTML = '<p>Nenhum prompt disponível.</p>';
+        } else {
+          prompts.forEach(prompt => {
+            const btn = document.createElement('button');
+            btn.className = 'prompt-btn';
+            btn.textContent = prompt.name;
+            btn.title = prompt.description;
+            
+            btn.onclick = () => {
+              insertPromptExample(prompt.name);
+            };
+            
+            promptButtons.appendChild(btn);
+          });
+        }
+      } catch (e) {
+        console.error('Erro ao carregar prompts:', e);
+        promptButtons.innerHTML = '<p>Erro ao carregar prompts.</p>';
+      }
+    }
+    
+    // Função para inserir exemplos de uso de prompts
+    function insertPromptExample(promptName) {
+      let example = '';
+      
+      switch (promptName) {
+        case 'newsletter_post':
+          example = 'Crie uma newsletter sobre o novo sistema de prompts contextuais';
+          break;
+        case 'release_note':
+          example = 'Gere uma nota de lançamento para a versão 2.0 com suporte a prompts contextuais';
+          break;
+        case 'summarize_notes':
+          example = 'Resuma todas as notas que temos no sistema';
+          break;
+        case 'tool_selection':
+          example = 'Quais ferramentas posso usar para gerenciar notas?';
+          break;
+        default:
+          example = `Utilize o prompt ${promptName}`;
+      }
+      
+      input.value = example;
+      input.focus();
+    }
+
     async function carregarNotas() {
       listaNotas.innerHTML = '<li>Carregando...</li>';
       try {
@@ -139,7 +206,9 @@
       }
     }
     
+    // Carregar dados iniciais
     carregarNotas();
+    carregarPrompts();
   </script>
 </body>
 </html> 
