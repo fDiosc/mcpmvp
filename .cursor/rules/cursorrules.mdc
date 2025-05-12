@@ -1,0 +1,62 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+{
+  "rules": [
+    {
+      "name": "Project Structure",
+      "description": "Use a clear folder structure. In Next.js (App Router), organize files under `app/` with subfolders per route containing `page.tsx`, `layout.tsx`, and optionally `loading.tsx`. Use a `components/` folder for reusable components. In Node.js, split responsibilities into `routes/`, `controllers/`, `services/`, and `models/`."
+    },
+    {
+      "name": "Plan Before Coding",
+      "description": "Always start by providing a clear, step-by-step plan or pseudocode before writing actual code. This helps the user understand the implementation and confirm logic before proceeding."
+    },
+    {
+      "name": "Functional and Modular Code",
+      "description": "Prefer functional, modular programming. Avoid unnecessary classes. Split logic into small, reusable functions. Follow DRY (Don't Repeat Yourself) and avoid deep nesting."
+    },
+    {
+      "name": "Naming and Formatting",
+      "description": "Use camelCase for variables/functions, PascalCase for components/classes, and kebab-case for filenames/folders. Variable names should be descriptive (e.g., `isLoading`, `handleSubmit`). Keep formatting consistent (indentation, quotes, semicolons)."
+    },
+    {
+      "name": "TypeScript First",
+      "description": "All code should be written in TypeScript. Use `interface` for objects, avoid `any`, prefer generics where applicable. Always define parameter, return, and prop types."
+    },
+    {
+      "name": "Use Standard Libraries",
+      "description": "Leverage established libraries: Express for Node.js backend, NextAuth for auth, Prisma or Mongoose for DB, Zod for validation, Axios or fetch for HTTP. Avoid reinventing the wheel."
+    },
+    {
+      "name": "Validation and Security",
+      "description": "Validate all user inputs using Zod or Joi. Use secure authentication (JWT, NextAuth, OAuth2). Never hardcode secrets. Always use HTTPS for external APIs. Add security headers when relevant."
+    },
+    {
+      "name": "Performance and Optimization",
+      "description": "Use dynamic imports (`next/dynamic`) for heavy components. Optimize images with Next.js `<Image />` component. Prefer React Server Components when possible. In Node.js, avoid blocking I/O and synchronous operations."
+    },
+    {
+      "name": "Error Handling",
+      "description": "Implement guard clauses and `try/catch` where needed. Handle invalid inputs at the top of functions. Provide clear error messages. Use custom error classes if appropriate."
+    },
+    {
+      "name": "Testing and Quality",
+      "description": "Provide unit tests using Jest and integration tests with Testing Library or supertest. Cover common and edge cases. Ensure the code passes lint and formatting checks (ESLint, Prettier)."
+    },
+    {
+      "name": "Comments and Clarity",
+      "description": "Add clear comments to explain complex logic. Use `// TODO:` for parts that need user clarification. Avoid redundant comments. Explain implementation decisions where multiple options exist."
+    },
+    {
+      "name": "No Unconfirmed Assumptions",
+      "description": "Do not add features that were not explicitly requested. If requirements are unclear, add comments or request clarification instead of guessing."
+    },
+    {
+      "name": "Documentation Output",
+      "description": "After implementing each feature or module, generate a README-style document describing the implementation. Include: purpose, step-by-step breakdown, architecture overview, endpoints (if any), file responsibilities, and usage instructions. This helps the user understand and maintain the code easily."
+    }
+  ]
+}
+

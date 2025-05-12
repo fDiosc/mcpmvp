@@ -101,6 +101,23 @@ The system now leverages Anthropic's prompt caching feature to improve performan
 - Conversation IDs are preserved to maintain cache validity
 - Detailed logs track cache creation/reading efficiency
 
+## Anthropic/Claude Integration Improvements (2024-07)
+
+### Conversational Flow Improvements
+- O ciclo de execução de ferramentas (tool use) agora é robusto: o backend executa um loop, processando múltiplos tool_use em sequência, até que a resposta final do assistente esteja pronta para renderização.
+- O endpoint `/chat` só retorna a resposta ao frontend quando não há mais tool_use pendente, garantindo que o usuário veja apenas a mensagem final consolidada.
+- O campo `history` retornado é atualizado corretamente, permitindo ao frontend manter o contexto conversacional e enviar o histórico em novas interações.
+- Logs do backend foram padronizados e reduzidos ao essencial, facilitando troubleshooting sem poluir o output.
+- O fluxo está compatível com múltiplos tool_use encadeados, evitando loops ou travamentos.
+
+### Frontend Integration
+- O frontend deve exibir loading até receber a resposta do backend, pois só será retornada quando a mensagem estiver pronta para renderização.
+- O histórico pode ser reaproveitado para manter contexto entre mensagens.
+
+### Troubleshooting
+- Se o modelo Anthropic solicitar múltiplos tool_use, todos serão processados automaticamente.
+- Em caso de erro na execução de uma ferramenta, o ciclo é interrompido e uma mensagem de erro amigável é retornada ao usuário.
+
 ## Setup
 
 ### Prerequisites

@@ -81,7 +81,7 @@ const notes: { [id: string]: Note } = {
   "2": { title: "Second Note", content: "This is note 2" }
 };
 
-console.error('DEBUG: [INICIO] Servidor MCP carregado. PID:', process.pid);
+console.log('[MCP] Servidor iniciado com sucesso.');
 
 // Crie o servidor MCP normalmente
 const server = new McpServer({
@@ -652,7 +652,30 @@ app.post('/chat', async (req: Request, res: Response) => {
           while (!completed) {
             await new Promise(resolve => setTimeout(resolve, 1000));
             runResult = await openai.beta.threads.runs.retrieve(thread.id, run.id);
-            
+            console.log('[DEBUG][OPENAI][RUN STATUS]', runResult.status, runResult);
+
+            // Se o run requer ação de ferramenta
+            if (runResult.status === 'requires_action' && runResult.required_action && runResult.required_action.submit_tool_outputs) {
+              const toolCalls = runResult.required_action.submit_tool_outputs.tool_calls;
+              const tool_outputs = [];
+              for (const call of toolCalls) {
+                const toolName = call.function.name;
+                const args = JSON.parse(call.function.arguments);
+                console.log('[DEBUG][OPENAI][TOOL OUTPUTS][CALL]', toolName, args);
+                const result = await mcpClient.callTool({ name: toolName, arguments: args });
+                let output = '';
+                if (result?.content && Array.isArray(result.content) && result.content[0]?.text) {
+                  output = result.content[0].text;
+                } else {
+                  output = JSON.stringify(result);
+                }
+                tool_outputs.push({ tool_call_id: call.id, output });
+              }
+              console.log('[DEBUG][OPENAI][TOOL OUTPUTS][SUBMIT]', tool_outputs);
+              const submitResult = await openai.beta.threads.runs.submitToolOutputs(thread.id, run.id, { tool_outputs });
+              console.log('[DEBUG][OPENAI][TOOL OUTPUTS][RESPONSE]', submitResult);
+            }
+
             if (runResult.status === 'completed' || 
                 runResult.status === 'failed' || 
                 runResult.status === 'cancelled') {
@@ -796,130 +819,63 @@ app.post('/chat', async (req: Request, res: Response) => {
       // A mensagem a ser enviada depende se detectamos um prompt ou não
       let userMessage = { 
         role: 'user' as const, 
-        content: [{ 
-          type: 'text' as const, 
-          text: userInput 
-        }]
+        content: [{ type: 'text' as const, text: userInput }]
       };
-      
-      let messages = [];
-      if (promptMessages) {
-        console.error('[LOG][CHAT] Using detected prompt for Anthropic API');
-        messages = promptMessages;
-      } else {
-        // Apenas a mensagem do usuário
-        messages = [userMessage];
-      }
-      
-      // Se o histórico foi fornecido, incorpore-o
+      let messages = promptMessages ? promptMessages : [userMessage];
       const providedHistory = req.body.history || [];
       if (providedHistory && Array.isArray(providedHistory) && providedHistory.length > 0) {
-        // Use apenas o histórico existente se não for a primeira mensagem
         if (messages.length === 1 && messages[0].role === 'user') {
-          // Insira o histórico antes da mensagem atual
           messages = [...providedHistory, ...messages];
-          console.error(`[LOG][CHAT] Incorporated ${providedHistory.length} message(s) from history`);
         }
       }
-      
-      // Log das mensagens formatadas para depuração
-      console.error('[LOG][CHAT] Anthropic messages:', JSON.stringify(messages));
-      
       const clientId = req.body.sessionId || `${req.ip}-${req.headers['user-agent']}`;
-      
-      // Transforma as ferramentas MCP para o formato Anthropic
       const anthropicTools = convertMcpToolsToAnthropicFormat(mcpTools.tools);
-      
-      try {
-        // Chama a API da Anthropic usando o helper existente
-        let response = await callClaudeDirectAPI(
-          messages, 
-          anthropicTools, 
+      let finished = false;
+      let recursion = 0;
+      const MAX_RECURSION = 5;
+      let response;
+      let responseText = '';
+      while (!finished && recursion < MAX_RECURSION) {
+        response = await callClaudeDirectAPI(
+          messages,
+          anthropicTools,
           clientId,
           systemPrompt as string | undefined
         );
-        console.error('[LOG][CHAT] Anthropic API response received');
-        
-        // Verificar se temos uma execução de ferramenta a realizar
+        // Verifica se há tool_use a ser processado
         if (response.stop_reason === 'tool_use' && response.content) {
-          console.error('[LOG][TOOLS] Tool use detected, initiating tool execution flow');
-          
-          // Encontrar o bloco tool_use
           const toolUseBlock = response.content.find((block: any) => block.type === 'tool_use');
           if (toolUseBlock) {
-            console.error(`[LOG][TOOLS] Tool to execute: ${toolUseBlock.name}`);
-            
-            // Cria uma função para executar a ferramenta usando o servidor MCP
             const executeTool = async (name: string, args: any) => {
-              console.error(`[LOG][TOOLS] Executing tool: ${name} with args:`, args);
-              try {
-                // Encontra a ferramenta por nome
-                const tool = mcpTools.tools.find((t: any) => t.name === name);
-                if (!tool) {
-                  throw new Error(`Tool not found: ${name}`);
-                }
-                
-                // Executa a ferramenta usando o cliente MCP
-                const result = await mcpClient.callTool({ name, arguments: args });
-                console.error(`[LOG][TOOLS] Tool execution result:`, result);
-                return result;
-              } catch (error) {
-                console.error(`[ERROR][TOOLS] Error executing tool ${name}:`, error);
-                throw error;
-              }
+              const tool = mcpTools.tools.find((t: any) => t.name === name);
+              if (!tool) throw new Error(`Tool not found: ${name}`);
+              return await mcpClient.callTool({ name, arguments: args });
             };
-            
-            // Usa handleToolExecution para executar a ferramenta e atualizar o histórico
             const { messageHistory } = await handleToolExecution(
               toolUseBlock,
               executeTool,
-              JSON.parse(JSON.stringify(messages)) // Deep copy para evitar mutações
+              JSON.parse(JSON.stringify(messages))
             );
-            
-            // Continua a conversa com o resultado da ferramenta
-            console.error(`[LOG][CHAT] Continuing conversation with tool result, history length: ${messageHistory.length}`);
-            response = await callClaudeDirectAPI(
-              messageHistory,
-              anthropicTools,
-              clientId,
-              systemPrompt as string | undefined
-            );
-            
-            // Atualiza o histórico para a próxima iteração
             messages = messageHistory;
+            recursion++;
+            continue; // Volta para nova chamada à Anthropic
           }
         }
-        
-        // Processa o histórico para retornar ao cliente
-        const history = [...messages]; // Começa com o histórico existente
-        
-        // Extrai a resposta de texto
-        let responseText = '';
+        // Se não há mais tool_use, extrai o texto e finaliza
+        finished = true;
         if (response && response.content && Array.isArray(response.content)) {
           const textBlocks = response.content.filter((block: any) => block.type === 'text');
           if (textBlocks.length > 0) {
             responseText = textBlocks.map((block: any) => block.text).join('\n');
           }
         }
-        
-        // Adiciona a resposta do assistente ao histórico (somente se não for ferramenta)
-        if (responseText) {
-          history.push({
-            role: 'assistant',
-            content: responseText
-          });
-        }
-        
-        // Retorna a resposta com o histórico atualizado
-        res.json({ 
-          response: responseText,
-          history: history
-        });
-      } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-        console.error('[ERROR][ANTHROPIC] Error processing chat:', errorMessage);
-        res.status(500).json({ error: `Error with Anthropic API: ${errorMessage}` });
       }
+      // Só neste ponto o frontend deve renderizar a resposta
+      const history = [...messages];
+      if (responseText) {
+        history.push({ role: 'assistant', content: responseText });
+      }
+      res.json({ response: responseText, history });
     } else {
       console.error('[Server] Modelo não suportado:', selectedModel);
       res.status(400).json({ error: 'Modelo não suportado.' });

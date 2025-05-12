@@ -333,11 +333,13 @@ export class DynamicPromptClient {
  * Função para logar informações sobre a detecção de prompts
  */
 export function logPromptDetection(message: string, promptName: string | null, params: any = {}) {
-  console.error('======== PROMPT DETECTION DEBUG ========');
-  console.error(`User message: "${message}"`);
-  console.error(`Detected prompt: ${promptName || 'NONE'}`);
-  if (promptName) {
-    console.error(`Parameters: ${JSON.stringify(params)}`);
+  // Log apenas o essencial para debugging de prompts
+  const logObj: any = {
+    userMessage: message,
+    detectedPrompt: promptName || 'NONE',
+  };
+  if (promptName && Object.keys(params).length > 0) {
+    logObj.parameters = params;
   }
-  console.error('========================================');
+  console.log('[PROMPT DETECTION]', logObj);
 } 
