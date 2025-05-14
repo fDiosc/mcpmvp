@@ -72,6 +72,204 @@ export interface CustomToolDefinition {
 }
 
 /**
+ * Reestrutura o histórico de mensagens para garantir que cada tool_result
+ * tenha um tool_use correspondente na mensagem anterior.
+ * 
+ * Esta função foi implementada para resolver problemas de compatibilidade
+ * com a API do Claude, que exige uma estrutura específica para ferramentas.
+ * Referência: PR #176 no repositório MCP (make tool call result spec compatible)
+ */
+function restructureToolMessages(messages: any[]): any[] {
+  // If we have fewer than 1 message, there's nothing to restructure
+  if (!messages || messages.length < 1) return []; 
+
+  const validatedMessages: CustomAnthropicMessage[] = [];
+  
+  // First pass: Collect all tool_use IDs and their associated message indices
+  const toolUseMap = new Map<string, number>(); // Maps tool_use IDs to message index in validatedMessages
+  
+  // Process each message first to validate and clean them
+  for (const msg of messages) {
+    if (!msg || !msg.role || msg.content === undefined || msg.content === null) {
+      console.warn('[LOG][ANTHROPIC_RESTRUCTURE] Skipping invalid or empty message (no role/content):', msg);
+      continue;
+    }
+
+    let currentMessageRole = msg.role as CustomAnthropicMessageRole;
+    if (currentMessageRole !== 'user' && currentMessageRole !== 'assistant') {
+      console.warn(`[LOG][ANTHROPIC_RESTRUCTURE] Invalid role: ${msg.role}. Skipping message.`);
+      continue;
+    }
+
+    let validatedContent: string | CustomContentBlock[];
+
+    if (typeof msg.content === 'string') {
+      validatedContent = [{ type: 'text', text: msg.content }];
+    } else if (Array.isArray(msg.content)) {
+      const processedBlocks: CustomContentBlock[] = [];
+      
+      for (const block of msg.content) {
+        if (!block || !block.type) {
+          console.warn('[LOG][ANTHROPIC_RESTRUCTURE] Skipping invalid block (no type):', block);
+          continue;
+        }
+        
+        switch (block.type) {
+          case 'text':
+            processedBlocks.push({ type: 'text', text: block.text || '' });
+            break;
+            
+          case 'tool_use':
+            if (block.id && block.name) {
+              processedBlocks.push({ 
+                type: 'tool_use', 
+                id: block.id, 
+                name: block.name, 
+                input: block.input || {} 
+              });
+            } else {
+              console.warn('[LOG][ANTHROPIC_RESTRUCTURE] Skipping invalid tool_use block (missing id or name):', block);
+            }
+            break;
+            
+          case 'tool_result':
+            if (block.tool_use_id) {
+              let resultBlockContent = block.content;
+              if (typeof resultBlockContent !== 'string') {
+                console.warn(`[LOG][ANTHROPIC_RESTRUCTURE] tool_result content is not a string. Stringifying: ID ${block.tool_use_id}`, resultBlockContent);
+                resultBlockContent = JSON.stringify(resultBlockContent);
+              }
+              processedBlocks.push({ 
+                type: 'tool_result', 
+                tool_use_id: block.tool_use_id, 
+                content: resultBlockContent 
+              });
+            } else {
+              console.warn('[LOG][ANTHROPIC_RESTRUCTURE] Skipping invalid tool_result block (missing tool_use_id):', block);
+            }
+            break;
+            
+          default:
+            console.warn(`[LOG][ANTHROPIC_RESTRUCTURE] Skipping unknown block type: ${block.type}`);
+            if (block.text) {
+              processedBlocks.push({type: 'text', text: `[Unsupported Block Type: ${block.type}] ${block.text}`});
+            }
+        }
+      }
+      
+      if (processedBlocks.length === 0 && msg.content.length > 0) {
+        console.warn('[LOG][ANTHROPIC_RESTRUCTURE] Message content became empty after block validation, originally had blocks:', msg.content);
+        validatedContent = [{type: 'text', text: "[Content Filtered Due To Invalid Blocks]"}];
+      } else if (processedBlocks.length === 0 && msg.content.length === 0) {
+        console.warn('[LOG][ANTHROPIC_RESTRUCTURE] Skipping message with initially empty content array.');
+        continue;
+      } else {
+        validatedContent = processedBlocks;
+      }
+    } else {
+      console.warn('[LOG][ANTHROPIC_RESTRUCTURE] Unknown message content type, attempting to convert to text block:', msg.content);
+      validatedContent = [{ type: 'text', text: JSON.stringify(msg.content) }];
+    }
+
+    // Only add the message if it has valid content after processing
+    if (validatedContent && (!Array.isArray(validatedContent) || validatedContent.length > 0)) {
+      // Add the message to our validated array
+      validatedMessages.push({
+        role: currentMessageRole,
+        content: validatedContent,
+      });
+      
+      // If this is an assistant message with tool_use blocks, record their IDs
+      if (currentMessageRole === 'assistant' && Array.isArray(validatedContent)) {
+        for (const block of validatedContent) {
+          if (block.type === 'tool_use' && block.id) {
+            toolUseMap.set(block.id, validatedMessages.length - 1);
+          }
+        }
+      }
+    } else {
+      console.warn('[LOG][ANTHROPIC_RESTRUCTURE] Message skipped as content was empty or invalid after processing:', msg);
+    }
+  }
+
+  // Second pass: Check for orphaned tool_result blocks and remove them or convert to text
+  const finalMessages: CustomAnthropicMessage[] = [];
+  let skipNextMessage = false;
+  
+  for (let i = 0; i < validatedMessages.length; i++) {
+    if (skipNextMessage) {
+      skipNextMessage = false;
+      continue;
+    }
+    
+    const currentMsg = validatedMessages[i];
+    
+    // If this is a user message, check for tool_result blocks
+    if (currentMsg.role === 'user' && Array.isArray(currentMsg.content)) {
+      const orphanedToolResults: CustomContentBlock[] = [];
+      const validToolResults: CustomContentBlock[] = [];
+      
+      for (const block of currentMsg.content) {
+        if (block.type === 'tool_result' && block.tool_use_id) {
+          // Check if there's a corresponding tool_use message
+          if (!toolUseMap.has(block.tool_use_id)) {
+            console.warn(`[LOG][ANTHROPIC_RESTRUCTURE] Found orphaned tool_result with ID: ${block.tool_use_id}`);
+            // Convert to text to preserve content
+            orphanedToolResults.push({
+              type: 'text',
+              text: `[Tool Result]: ${block.content}`
+            });
+          } else {
+            validToolResults.push(block);
+          }
+        } else {
+          validToolResults.push(block);
+        }
+      }
+      
+      // If we have both valid and orphaned results, replace the content with valid ones
+      // and create a new message for orphaned ones if needed
+      if (orphanedToolResults.length > 0) {
+        if (validToolResults.length > 0) {
+          // Keep the valid tool results in this message
+          finalMessages.push({
+            role: 'user',
+            content: validToolResults
+          });
+          
+          // Add a new message with the orphaned results converted to text
+          if (orphanedToolResults.length > 0) {
+            finalMessages.push({
+              role: 'user',
+              content: orphanedToolResults
+            });
+          }
+        } else {
+          // If all are orphaned, just convert them all to text
+          finalMessages.push({
+            role: 'user',
+            content: orphanedToolResults
+          });
+        }
+      } else {
+        // No orphaned results, keep the message as is
+        finalMessages.push(currentMsg);
+      }
+    } else {
+      // For assistant messages or user messages without tool_result, keep as is
+      finalMessages.push(currentMsg);
+    }
+  }
+
+  // Log the outcome of restructuring for debugging
+  if (messages.length !== finalMessages.length) {
+    console.log(`[LOG][ANTHROPIC_RESTRUCTURE] Original message count: ${messages.length}, Validated message count: ${finalMessages.length}. Some messages may have been filtered or corrected.`);
+  }
+  
+  return finalMessages;
+}
+
+/**
  * Calls the Claude API directly
  * @param messages The messages to send to Claude
  * @param tools The tools available to Claude
@@ -87,62 +285,110 @@ export async function callClaudeDirectAPI(
   try {
     console.error('[LOG][ANTHROPIC] Calling Claude API with messages and tools');
     
+    // Add detailed logging for debugging tool_use and tool_result structure
+    let toolUseIds = new Set<string>();
+    let toolResultIds = new Set<string>();
+    
+    // Analyze messages to detect potential issues before restructuring
+    messages.forEach((msg, idx) => {
+      if (msg?.role === 'assistant' && Array.isArray(msg?.content)) {
+        msg.content.forEach((block: any) => {
+          if (block?.type === 'tool_use' && block?.id) {
+            toolUseIds.add(block.id);
+          }
+        });
+      }
+      
+      if (msg?.role === 'user' && Array.isArray(msg?.content)) {
+        msg.content.forEach((block: any) => {
+          if (block?.type === 'tool_result' && block?.tool_use_id) {
+            toolResultIds.add(block.tool_use_id);
+          }
+        });
+      }
+    });
+    
+    // Detect orphaned tool_result blocks (no matching tool_use)
+    const orphanedToolResults = Array.from(toolResultIds).filter(id => !toolUseIds.has(id));
+    if (orphanedToolResults.length > 0) {
+      console.warn(`[LOG][ANTHROPIC] WARNING: Found ${orphanedToolResults.length} orphaned tool_result blocks with no matching tool_use:`, orphanedToolResults);
+    }
+    
+    // Log message structure before restructuring
+    console.log(`[LOG][ANTHROPIC] Pre-restructuring stats: ${messages.length} messages, ${toolUseIds.size} tool_use blocks, ${toolResultIds.size} tool_result blocks`);
+    
+    // Reestruturar mensagens para manter contexto sem problemas de ferramentas
+    // Esta etapa é crucial para a API do Claude, que exige uma estrutura específica
+    // onde cada tool_result deve ter um tool_use correspondente na mensagem anterior
+    const restructuredMessages = restructureToolMessages(messages);
+    
     // Generate a session ID if not provided
     const currentSessionId = sessionId || 'default-session';
     const conversationId = getConversationId(currentSessionId);
     
+    // Add post-restructuring stats
+    let postToolUseCount = 0;
+    let postToolResultCount = 0;
+    restructuredMessages.forEach(msg => {
+      if (Array.isArray(msg.content)) {
+        msg.content.forEach((block: any) => {
+          if (block.type === 'tool_use') postToolUseCount++;
+          if (block.type === 'tool_result') postToolResultCount++;
+        });
+      }
+    });
+    
+    console.log(`[LOG][ANTHROPIC] Post-restructuring stats: ${restructuredMessages.length} messages, ${postToolUseCount} tool_use blocks, ${postToolResultCount} tool_result blocks`);
+    
     // Convert our messages to a simpler format that's compatible with the Anthropic API
-    const formattedMessages: MessageParam[] = messages.map((msg: any) => {
-      // Handle string content
-      if (typeof msg.content === 'string') {
+    const formattedMessages: MessageParam[] = restructuredMessages.map((msg: CustomAnthropicMessage) => {
+      // restructuredMessages should now provide msg.content as either a string (for rare direct pass-through)
+      // or an array of CustomContentBlock which should be compatible with Anthropic's ContentBlockParam.
+      if (typeof msg.content === 'string') { // Should be less common now for user/assistant, mainly if restructureToolMessages had a direct pass-through
         return {
           role: msg.role,
           content: msg.content
         };
       }
       
-      // Handle array content (blocks)
+      // If msg.content is an array of CustomContentBlock, it should be directly usable
+      // as ContentBlockParam[] after validation by restructureToolMessages.
       if (Array.isArray(msg.content)) {
+        // We now trust that restructureToolMessages has prepared blocks that are valid ContentBlockParams.
+        // However, the Anthropic SDK types are specific (e.g., TextBlock, ToolUseBlock, ToolResultBlock).
+        // We need to ensure our CustomContentBlock array maps to these specific types if an explicit cast is not enough.
+        // For now, let's cast and rely on runtime validation if types are subtly incompatible.
+        // A more robust solution might involve a specific mapping function here if direct casting fails.
+        const sdkContentBlocks: ContentBlockParam[] = msg.content.map(customBlock => {
+            if (customBlock.type === 'text') {
+                return { type: 'text', text: customBlock.text || '' } as Anthropic.TextBlockParam;
+            }
+            if (customBlock.type === 'tool_use') {
+                return { type: 'tool_use', id: customBlock.id!, name: customBlock.name!, input: customBlock.input! } as Anthropic.ToolUseBlockParam;
+            }
+            if (customBlock.type === 'tool_result') {
+                // Anthropic SDK expects content for tool_result to be string or an array of specific blocks (Text, Image)
+                // Our restructureToolMessages now ensures customBlock.content is a string here.
+                return { type: 'tool_result', tool_use_id: customBlock.tool_use_id!, content: customBlock.content! } as Anthropic.ToolResultBlockParam;
+            }
+            // Fallback for unknown block types from CustomContentBlock not mapping to SDK - should be filtered by restructureToolMessages
+            console.warn("[LOG][ANTHROPIC_FORMAT] Unknown customBlock type during SDK mapping:", customBlock);
+            return { type: 'text', text: `[Invalid Block Type: ${customBlock.type}] ${JSON.stringify(customBlock)}` } as Anthropic.TextBlockParam;
+        });
+
         return {
           role: msg.role,
-          content: msg.content.map((block: any) => {
-            if (block.type === 'text') {
-              return {
-                type: 'text' as const,
-                text: block.text || ''
-              };
-            }
-            if (block.type === 'tool_use') {
-              return {
-                type: 'tool_use' as const,
-                id: block.id || uuidv4(),
-                name: block.name || '',
-                input: block.input || {}
-              };
-            }
-            if (block.type === 'tool_result') {
-              return {
-                type: 'tool_result' as const,
-                tool_use_id: block.tool_use_id || '',
-                content: block.content || ''
-              };
-            }
-            
-            // Default fallback
-            return {
-              type: 'text' as const,
-              text: JSON.stringify(block)
-            };
-          })
+          content: sdkContentBlocks.filter(block => block !== null) // Filter out any nulls from bad conversions
         };
       }
       
-      // Default fallback for unknown message formats
+      // Fallback for any other unexpected message formats not caught by restructureToolMessages
+      console.warn("[LOG][ANTHROPIC_FORMAT] Unexpected message structure for formatting (content not string or array): ", msg);
       return {
         role: msg.role,
-        content: 'Unknown message format'
+        content: '[Invalid Message Content Structure]' // Provide a default valid content
       };
-    });
+    }).filter(msg => msg.content && (typeof msg.content === 'string' ? msg.content.length > 0 : msg.content.length > 0)); // Filter out messages that ended up with no content
     
     // Apply cache control if needed
     let messagesWithCaching = formattedMessages;
@@ -164,6 +410,14 @@ export async function callClaudeDirectAPI(
     const estimatedTokens = Math.ceil(inputJson.length / 4); // Very rough estimate
     console.error(`[LOG][CACHE] Estimated input tokens: ~${estimatedTokens} (min cacheable threshold: 2048)`);
     
+    // >>> ADD DETAILED LOGGING HERE <<<
+    console.error("[LOG][ANTHROPIC_REQUEST_PAYLOAD] Messages being sent:", JSON.stringify(messagesWithCaching, null, 2));
+    console.error("[LOG][ANTHROPIC_REQUEST_PAYLOAD] Tools being sent:", JSON.stringify(formattedTools, null, 2));
+    if (systemPrompt) {
+      console.error("[LOG][ANTHROPIC_REQUEST_PAYLOAD] System prompt being sent:", systemPrompt);
+    }
+    // >>> END DETAILED LOGGING <<<
+
     // Make API call with type assertions to ensure compatibility
     const response = await anthropic.messages.create(
       {
@@ -434,6 +688,37 @@ export async function handleToolExecution(
   
   console.log(`[LOG][ANTHROPIC] Executing tool: ${name}`);
   
+  // Check if we've already called this exact tool with these exact parameters
+  // This helps prevent infinite loops where Claude keeps requesting the same tool
+  const isDuplicateToolCall = messageHistory.some(msg => {
+    if (msg.role !== 'assistant' || !Array.isArray(msg.content)) return false;
+    
+    return msg.content.some(block => {
+      if (block.type !== 'tool_use' || block.name !== name) return false;
+      
+      // Compare input objects for deep equality
+      return JSON.stringify(block.input) === JSON.stringify(input);
+    });
+  });
+  
+  if (isDuplicateToolCall) {
+    console.log(`[LOG][ANTHROPIC] Detected duplicate tool call for ${name}. Skipping execution to prevent loop.`);
+    // Return a modified message history with a note about the duplicate call
+    // Don't actually add a new tool_use since Claude already has one
+    messageHistory.push({
+      role: "user",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: toolUseId,
+          content: `Tool ${name} was already called with the same parameters. To prevent an infinite loop, this duplicate call was intercepted.`
+        }
+      ]
+    });
+    
+    return { messageHistory, toolResult: { content: [{ type: 'text', text: 'Duplicate tool call intercepted.' }] } };
+  }
+  
   try {
     // Normaliza argumentos para camelCase
     const normalizedInput = snakeToCamel(input);
@@ -445,6 +730,7 @@ export async function handleToolExecution(
     const resultContent = toolResult?.content?.[0]?.text || JSON.stringify(toolResult);
     
     // Add assistant message with tool use - using id for tool_use blocks
+    // Make sure the ID is preserved exactly as received from Claude
     messageHistory.push({
       role: "assistant",
       content: [
@@ -458,6 +744,7 @@ export async function handleToolExecution(
     });
     
     // Add user message with tool result - using tool_use_id for tool_result blocks
+    // This must exactly match the id from the tool_use block
     messageHistory.push({
       role: "user",
       content: [

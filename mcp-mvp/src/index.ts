@@ -55,6 +55,8 @@ import { registerSummarizeNotesPrompt, registerToolSelectionPrompt, registerNews
 import { DynamicPromptClient } from './client/dynamicPrompts.js';
 import { OpenAI } from "openai";
 import Anthropic from "@anthropic-ai/sdk";
+import { CustomAnthropicMessage, CustomContentBlock } from './anthropicClient.js';
+import { v4 as uuidv4 } from 'uuid';
 dotenv.config();
 
 // Instância do OpenAI para chamar a API
@@ -816,66 +818,199 @@ app.post('/chat', async (req: Request, res: Response) => {
       // Claude via API direta da Anthropic
       console.error('[LOG][CHAT] Using direct Anthropic API integration');
       
-      // A mensagem a ser enviada depende se detectamos um prompt ou não
-      let userMessage = { 
-        role: 'user' as const, 
-        content: [{ type: 'text' as const, text: userInput }]
-      };
-      let messages = promptMessages ? promptMessages : [userMessage];
+      const userInputText = typeof req.body.message === 'string' ? req.body.message : JSON.stringify(req.body.message);
+
+      // Initialize currentTurnMessages: Start with client-provided history, or empty if none.
+      let currentTurnMessages: CustomAnthropicMessage[] = [];
       const providedHistory = req.body.history || [];
-      if (providedHistory && Array.isArray(providedHistory) && providedHistory.length > 0) {
-        if (messages.length === 1 && messages[0].role === 'user') {
-          messages = [...providedHistory, ...messages];
-        }
+
+      if (Array.isArray(providedHistory) && providedHistory.length > 0) {
+        console.error('[LOG][ANTHROPIC] Initializing with history provided by client.');
+        // Deep copy to avoid modifying client's original history object if it's passed by reference elsewhere
+        currentTurnMessages = JSON.parse(JSON.stringify(providedHistory));
       }
-      const clientId = req.body.sessionId || `${req.ip}-${req.headers['user-agent']}`;
+
+      // Add current user input as a new message.
+      // Ensure content is an array of blocks as per CustomAnthropicMessage.
+      currentTurnMessages.push({ 
+        role: 'user' as const, 
+        content: [{ type: 'text' as const, text: userInputText }] 
+      });
+      
+      // Usamos um ID de sessão consistente para benefícios de cache com a Anthropic
+      const clientId = req.body.sessionId || `jira-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+      console.error(`[LOG][ANTHROPIC] Usando ID de sessão para cache: ${clientId}`);
+      
       const anthropicTools = convertMcpToolsToAnthropicFormat(mcpTools.tools);
       let finished = false;
       let recursion = 0;
-      const MAX_RECURSION = 5;
-      let response;
-      let responseText = '';
-      while (!finished && recursion < MAX_RECURSION) {
-        response = await callClaudeDirectAPI(
-          messages,
-          anthropicTools,
-          clientId,
-          systemPrompt as string | undefined
-        );
-        // Verifica se há tool_use a ser processado
-        if (response.stop_reason === 'tool_use' && response.content) {
-          const toolUseBlock = response.content.find((block: any) => block.type === 'tool_use');
-          if (toolUseBlock) {
-            const executeTool = async (name: string, args: any) => {
-              const tool = mcpTools.tools.find((t: any) => t.name === name);
-              if (!tool) throw new Error(`Tool not found: ${name}`);
-              return await mcpClient.callTool({ name, arguments: args });
-            };
-            const { messageHistory } = await handleToolExecution(
-              toolUseBlock,
-              executeTool,
-              JSON.parse(JSON.stringify(messages))
-            );
-            messages = messageHistory;
-            recursion++;
-            continue; // Volta para nova chamada à Anthropic
+      const MAX_RECURSION = 5; // Max tool uses per turn
+      let apiResponseObject: any; // To store the full API response object from Claude
+      
+      // Tracking previous tool calls to prevent loops - use a more robust signature
+      const toolCallTracker = new Set<string>(); 
+      
+      try {
+        // Loop de processamento de ferramentas
+        while (!finished && recursion < MAX_RECURSION) {
+          console.error(`[LOG][ANTHROPIC] Chamada para Claude API (iteração ${recursion + 1}/${MAX_RECURSION})`);
+          
+          apiResponseObject = await callClaudeDirectAPI(
+            currentTurnMessages, // Pass the meticulously built history
+            anthropicTools,
+            clientId,
+            systemPrompt as string | undefined // Assuming systemPrompt is defined elsewhere or undefined
+          );
+          
+          // Add assistant's response (which might include text and tool_use) to history
+          const assistantResponseContent: CustomContentBlock[] = (apiResponseObject.content || [])
+            .map((block: any): CustomContentBlock | null => {
+              if (block.type === 'text') return { type: 'text', text: block.text } as CustomContentBlock;
+              if (block.type === 'tool_use') return { type: 'tool_use', id: block.id, name: block.name, input: block.input } as CustomContentBlock;
+              return null;
+            })
+            .filter((block: any): block is CustomContentBlock => block !== null);
+
+          if (assistantResponseContent.length > 0) {
+            currentTurnMessages.push({
+              role: 'assistant',
+              content: assistantResponseContent,
+            });
+          } else if (apiResponseObject.stop_reason === 'end_turn' && !apiResponseObject.content?.some((b:any) => b.type === 'text')) {
+            // Handle cases where Anthropic might return an empty content array on end_turn (e.g. after only tool calls)
+            // Push a minimal assistant message if needed to signify turn completion if no text part.
+             currentTurnMessages.push({role: 'assistant', content: [{type: 'text', text: ""}] }); // Or handle appropriately
           }
-        }
-        // Se não há mais tool_use, extrai o texto e finaliza
-        finished = true;
-        if (response && response.content && Array.isArray(response.content)) {
-          const textBlocks = response.content.filter((block: any) => block.type === 'text');
-          if (textBlocks.length > 0) {
-            responseText = textBlocks.map((block: any) => block.text).join('\n');
+
+
+          if (apiResponseObject.stop_reason === 'tool_use') {
+            finished = false; // Not finished, Claude wants to use tools
+            const toolUseBlocks = assistantResponseContent.filter(block => block.type === 'tool_use');
+            
+            if (!toolUseBlocks || toolUseBlocks.length === 0) {
+              console.error("[LOG][ANTHROPIC] Stop reason is tool_use, but no tool_use blocks found in content. Breaking.");
+              finished = true; // Avoid infinite loop
+              break;
+            }
+
+            const toolResultsForThisTurn: CustomContentBlock[] = [];
+
+            for (const toolUseBlock of toolUseBlocks) {
+              if (!toolUseBlock.id || !toolUseBlock.name) {
+                 console.error("[LOG][ANTHROPIC] Invalid tool_use block received:", toolUseBlock);
+                 toolResultsForThisTurn.push({
+                    type: 'tool_result',
+                    tool_use_id: toolUseBlock.id || `error_unknown_tool_id_${uuidv4()}`,
+                    content: "Error: Tool use block was malformed."
+                 });
+                 continue;
+              }
+
+              const toolCallSignature = `${toolUseBlock.name}_${JSON.stringify(toolUseBlock.input || {})}`;
+              if (toolCallTracker.has(toolCallSignature)) {
+                console.warn(`[LOG][ANTHROPIC] Duplicate tool call detected and blocked: ${toolUseBlock.name}`);
+                toolResultsForThisTurn.push({
+                  type: 'tool_result',
+                  tool_use_id: toolUseBlock.id,
+                  content: `Error: Tool ${toolUseBlock.name} was called again with the exact same parameters in this turn. This indicates a potential loop.`
+                });
+                continue; 
+              }
+              toolCallTracker.add(toolCallSignature);
+
+              console.error(`[LOG][ANTHROPIC] Processando chamada de ferramenta: ${toolUseBlock.name}`);
+              try {
+                const executionResult = await mcpClient.callTool({ name: toolUseBlock.name, arguments: toolUseBlock.input });
+                let resultStringContent: string;
+
+                if (executionResult && executionResult.content && Array.isArray(executionResult.content) && executionResult.content.length > 0) {
+                  // Prefer text if available, otherwise stringify the first content block
+                  resultStringContent = executionResult.content[0].text || JSON.stringify(executionResult.content[0]);
+                } else if (typeof executionResult.content === 'string') {
+                  resultStringContent = executionResult.content;
+                } else {
+                  resultStringContent = JSON.stringify(executionResult); // Fallback
+                }
+                
+                toolResultsForThisTurn.push({
+                  type: 'tool_result',
+                  tool_use_id: toolUseBlock.id,
+                  content: resultStringContent, // Anthropic expects string or [{type: 'text', text: '...'}]
+                                               // If resultStringContent could be very large, consider if it should be structured
+                });
+              } catch (toolExecError: any) {
+                console.error(`[ERROR][ANTHROPIC] Erro ao executar ferramenta ${toolUseBlock.name}:`, toolExecError);
+                toolResultsForThisTurn.push({
+                  type: 'tool_result',
+                  tool_use_id: toolUseBlock.id,
+                  content: `Error executing tool ${toolUseBlock.name}: ${toolExecError.message}`
+                });
+              }
+            }
+
+            if (toolResultsForThisTurn.length > 0) {
+              currentTurnMessages.push({
+                role: 'user', // This message contains results OF tools requested by assistant
+                content: toolResultsForThisTurn,
+              });
+            }
+            // Ensure we don't fall into an immediate loop if all tool calls were duplicates/errors
+            if (toolResultsForThisTurn.every(tr => (tr as any).is_error && toolCallTracker.has(`${(toolUseBlocks.find(tu => tu.id === tr.tool_use_id) || {}).name}_${JSON.stringify((toolUseBlocks.find(tu => tu.id === tr.tool_use_id) || {}).input || {})}`))) {
+                // If all tools resulted in errors because they were duplicates that were already tracked,
+                // we might be in a loop. Better to break.
+                console.warn("[LOG][ANTHROPIC] All tool calls in this step were duplicate errors. Breaking to prevent loop.");
+                finished = true;
+            }
+
+          } else {
+            // If stop_reason is 'end_turn' or other reasons like 'max_tokens'
+            finished = true;
+            console.error(`[LOG][ANTHROPIC] Processamento concluído por Claude, motivo: ${apiResponseObject.stop_reason}`);
           }
+          recursion++;
+        } // End of while loop for tool processing
+
+        if (recursion >= MAX_RECURSION) {
+          console.warn("[LOG][ANTHROPIC] Max recursion depth reached for tool processing.");
+          // Potentially add a message to currentTurnMessages indicating this
         }
+
+        // Extract final text response for the client
+        let finalResponseText = '';
+        const lastAssistantMsg = currentTurnMessages.filter(m => m.role === 'assistant').pop();
+        if (lastAssistantMsg && Array.isArray(lastAssistantMsg.content)) {
+          finalResponseText = lastAssistantMsg.content
+            .filter((c: CustomContentBlock) => c.type === 'text' && c.text)
+            .map((c: CustomContentBlock) => c.text)
+            .join('\n');
+        } else if (lastAssistantMsg && typeof lastAssistantMsg.content === 'string') { // Should be rare with current block logic
+            finalResponseText = lastAssistantMsg.content;
+        }
+        
+        // If the very last message from assistant was tool_use and we broke loop,
+        // finalResponseText might be empty. Client should handle this.
+        // Or, provide a default message.
+        if (!finalResponseText && apiResponseObject && apiResponseObject.stop_reason !== 'end_turn') {
+            finalResponseText = "[O assistente terminou de usar ferramentas, mas não forneceu uma mensagem de texto final.]";
+        }
+
+
+        console.error('[LOG][CHAT] Final response to frontend:', { text: finalResponseText, historyLength: currentTurnMessages.length });
+        res.json({ 
+          response: finalResponseText,
+          history: currentTurnMessages // Send the meticulously constructed history back
+        });
+
+      } catch (err: any) {
+        console.error('[ERROR][ANTHROPIC_CHAT_HANDLER]', err);
+        // Handle the specific error for recovery, if applicable from previous logs
+        if (err.status === 400 && err.error?.error?.message?.includes("unexpected `tool_use_id`")) {
+             console.error('[LOG][ANTHROPIC] Detectado erro de estrutura (400) na API Anthropic. O histórico pode estar malformado.');
+             // The recovery logic with new conversation ID is now less preferred
+             // as history should be built correctly. This error should ideally not happen.
+        }
+        res.status(err.status || 500).json({ error: `Erro ao processar mensagem com Anthropic (Direto): ${err.message}` });
       }
-      // Só neste ponto o frontend deve renderizar a resposta
-      const history = [...messages];
-      if (responseText) {
-        history.push({ role: 'assistant', content: responseText });
-      }
-      res.json({ response: responseText, history });
     } else {
       console.error('[Server] Modelo não suportado:', selectedModel);
       res.status(400).json({ error: 'Modelo não suportado.' });
@@ -1091,7 +1226,7 @@ app.get('/prompts/list', async (_req, res) => {
     const formattedPrompts = [
       { 
         name: 'summarize_notes', 
-        description: 'Resumir todas as notas do sistema',
+        description: 'Resumir todas as notas do sistema, essa tool só deve ser usada se o usuário pedir para resumir notas',
         arguments: []
       },
       { 

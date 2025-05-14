@@ -298,14 +298,6 @@ export class DynamicPromptClient {
       };
     }
     
-    if (promptName === 'summarize_notes') {
-      // Use o sistema para o prompt de resumo
-      return {
-        messages: [],
-        system: `Você é um assistente especializado em resumo de notas. Seu trabalho é criar um resumo conciso e bem estruturado das notas fornecidas pelo usuário. O resumo deve capturar os pontos principais e manter a organização lógica.`,
-        shouldAppend: false
-      };
-    }
     
     if (promptName === 'release_note') {
       const version = params.version || 'próxima versão';
