@@ -1,49 +1,95 @@
 import { z } from 'zod';
-import fetch from 'node-fetch';
+import fetch, { RequestInit, Response } from 'node-fetch';
+import { UserJiraCredentials, RequestContext } from './types.js';
 
-// Common utility for Jira authentication
-function getJiraAuth() {
-  const username = process.env.JIRA_USERNAME;
-  const apiToken = process.env.JIRA_API_TOKEN;
-  
-  if (!username || !apiToken) {
-    throw new Error('Jira configuration missing. Please set JIRA_USERNAME and JIRA_API_TOKEN.');
+// New function to get Jira credentials dynamically or from environment
+async function getJiraCredentials(requestContext?: RequestContext): Promise<UserJiraCredentials> {
+  const USE_ENV_FOR_JIRA_CREDENTIALS = process.env.USE_ENV_FOR_JIRA_CREDENTIALS === 'true';
+
+  if (!USE_ENV_FOR_JIRA_CREDENTIALS && requestContext?.userJiraCredentials) {
+    if (
+      requestContext.userJiraCredentials.baseUrl &&
+      requestContext.userJiraCredentials.username &&
+      requestContext.userJiraCredentials.apiToken
+    ) {
+      console.log(`[JiraClient] Using dynamic user credentials for user: ${requestContext.productLabUserId || 'Unknown'}`);
+      return requestContext.userJiraCredentials;
+    } else {
+      console.error('[JiraClient] Attempted to use dynamic credentials, but they are incomplete.', requestContext.userJiraCredentials);
+      throw new Error('Incomplete dynamic Jira credentials provided.');
+    }
+  }
+
+  if (USE_ENV_FOR_JIRA_CREDENTIALS) {
+    const ENV_JIRA_BASE_URL = process.env.JIRA_BASE_URL;
+    const ENV_JIRA_USERNAME = process.env.JIRA_USERNAME;
+    const ENV_JIRA_API_TOKEN = process.env.JIRA_API_TOKEN;
+    if (ENV_JIRA_BASE_URL && ENV_JIRA_USERNAME && ENV_JIRA_API_TOKEN) {
+      console.log('[JiraClient] Using environment credentials for Jira.');
+      return {
+        baseUrl: ENV_JIRA_BASE_URL,
+        username: ENV_JIRA_USERNAME,
+        apiToken: ENV_JIRA_API_TOKEN,
+      };
+    } else {
+      console.error('[JiraClient] USE_ENV_FOR_JIRA_CREDENTIALS is true, but environment variables are incomplete.');
+      throw new Error('Jira environment variables (JIRA_BASE_URL, JIRA_USERNAME, JIRA_API_TOKEN) are not fully set.');
+    }
   }
   
-  return Buffer.from(`${username}:${apiToken}`).toString('base64');
+  console.error('[JiraClient] Critical credential configuration error. Unable to determine Jira credentials. USE_ENV_FOR_JIRA_CREDENTIALS is false and no dynamic credentials were provided or were incomplete.');
+  throw new Error('Jira credentials configuration error. Cannot proceed with Jira API call.');
 }
 
-// Common utility for API calls
-async function callJiraApi(endpoint: string, options: any = {}) {
-  const baseUrl = process.env.JIRA_BASE_URL;
-  
-  if (!baseUrl) {
-    throw new Error('Jira configuration missing. Please set JIRA_BASE_URL.');
-  }
-  
-  const url = `${baseUrl}${endpoint}`;
-  const auth = getJiraAuth();
-  
-  const defaultOptions = {
-    headers: {
-      'Authorization': `Basic ${auth}`,
-      'Accept': 'application/json',
-    },
+// Common utility for API calls - Modified
+async function callJiraApi(
+  endpoint: string,
+  method: 'GET' | 'POST' | 'PUT' | 'DELETE' = 'GET', // Added method parameter with default
+  options: Omit<RequestInit, 'method' | 'headers' | 'body'> & { // Refined options type
+    payload?: unknown;
+    customHeaders?: Record<string, string>;
+  } = {},
+  requestContext?: RequestContext // Added requestContext
+): Promise<any> {
+  const creds = await getJiraCredentials(requestContext);
+  const { baseUrl, username, apiToken } = creds;
+
+  const url = `${baseUrl.replace(/\/$/, '')}${endpoint}`; // Avoid double slashes
+  const authToken = Buffer.from(`${username}:${apiToken}`).toString('base64');
+
+  const headers: Record<string, string> = {
+    'Authorization': `Basic ${authToken}`,
+    'Accept': 'application/json',
+    'Content-Type': 'application/json', // Usually needed for POST/PUT
+    ...(options.customHeaders || {}),
   };
   
-  const fetchOptions = { ...defaultOptions, ...options };
-  
+  const fetchOptions: RequestInit = {
+    ...options,
+    method: method,
+    headers: headers,
+    body: options.payload ? JSON.stringify(options.payload) : undefined,
+  };
+
+  console.log(`[JiraClient] Making ${method} request to ${url}`); // Avoid logging sensitive parts
+
   try {
-    const response = await fetch(url, fetchOptions);
+    const response: Response = await fetch(url, fetchOptions);
     
     if (!response.ok) {
       const errorText = await response.text();
-      throw new Error(`Jira API error: ${response.status} ${response.statusText}\n${errorText}`);
+      console.error(`[JiraClient] Jira API Error: ${response.status} ${response.statusText}`, errorText);
+      throw new Error(`Jira API error: ${response.status} ${response.statusText}\\n${errorText}`);
     }
     
+    if (response.status === 204) { // Handle No Content
+      return null;
+    }
     return await response.json();
   } catch (error) {
-    throw error;
+    // Log already happens in the calling function or above if it's a new Error
+    // console.error('[JiraClient] Exception during Jira API call:', error); 
+    throw error; // Re-throw to be handled by the caller
   }
 }
 
@@ -78,9 +124,8 @@ export const getJiraIssueTool = {
   description: 'Fetches a Jira issue by its key',
 };
 
-// Executor da tool (adaptado do Jira MCP)
-export async function getJiraIssueExecutor(args: any, _extra: any) {
-  // Validação opcional
+// Executor da tool (adaptado do Jira MCP) - Modified
+export async function getJiraIssueExecutor(args: any, requestContext: RequestContext) { // Modified signature
   const parsed = getJiraIssueZodSchema.safeParse(args);
   if (!parsed.success) {
     return {
@@ -92,42 +137,12 @@ export async function getJiraIssueExecutor(args: any, _extra: any) {
     };
   }
   const { issueKey } = parsed.data;
-  const baseUrl = process.env.JIRA_BASE_URL;
-  const username = process.env.JIRA_USERNAME;
-  const apiToken = process.env.JIRA_API_TOKEN;
-
-  if (!baseUrl || !username || !apiToken) {
-    return {
-      content: [{
-        type: "text" as const,
-        text: 'Jira configuration missing. Please set JIRA_BASE_URL, JIRA_USERNAME, and JIRA_API_TOKEN.'
-      }],
-      isError: true
-    };
-  }
-
-  const url = `${baseUrl}/rest/api/3/issue/${issueKey}?expand=changelog`;
-  const auth = Buffer.from(`${username}:${apiToken}`).toString('base64');
+  
+  const endpoint = `/rest/api/3/issue/${issueKey}?expand=changelog`;
 
   try {
-    const response = await fetch(url, {
-      method: 'GET',
-      headers: {
-        'Authorization': `Basic ${auth}`,
-        'Accept': 'application/json',
-      },
-    });
-    if (!response.ok) {
-      const errorText = await response.text();
-      return {
-        content: [{
-          type: "text" as const,
-          text: `Error fetching Jira issue: ${response.status} ${response.statusText}\n${errorText}`
-        }],
-        isError: true
-      };
-    }
-    const data = await response.json();
+    // Refactored to use callJiraApi
+    const data = await callJiraApi(endpoint, 'GET', {}, requestContext); 
     return {
       content: [{
         type: "text" as const,
@@ -138,7 +153,7 @@ export async function getJiraIssueExecutor(args: any, _extra: any) {
     return {
       content: [{
         type: "text" as const,
-        text: `Exception: ${err.message}`
+        text: `Exception fetching Jira issue ${issueKey}: ${err.message}` // Added issueKey for context
       }],
       isError: true
     };
@@ -195,67 +210,51 @@ export const getDetailedJiraIssueTool = {
   description: 'Fetches a Jira issue with detailed information and optionally specified fields',
 };
 
-// Executor
-export async function getDetailedJiraIssueExecutor(args: any, _extra: any) {
+// Executor - Modified
+export async function getDetailedJiraIssueExecutor(args: any, requestContext: RequestContext) { // Modified signature
+  const parsed = getDetailedJiraIssueZodSchema.safeParse(args);
+  if (!parsed.success) {
+    return {
+      content: [{
+        type: "text" as const,
+        text: 'Invalid arguments: ' + JSON.stringify(parsed.error.issues)
+      }],
+      isError: true
+    };
+  }
+  
+  const { issueKey, fields, expand } = parsed.data;
+  
+  const queryParams = new URLSearchParams();
+  if (fields) queryParams.append('fields', fields);
+  if (expand) queryParams.append('expand', expand);
+  
+  const endpoint = `/rest/api/3/issue/${issueKey}${queryParams.toString() ? '?' + queryParams.toString() : ''}`;
+  
   try {
-    const parsed = getDetailedJiraIssueZodSchema.safeParse(args);
-    if (!parsed.success) {
-      return {
-        content: [{
-          type: "text" as const,
-          text: 'Invalid arguments: ' + JSON.stringify(parsed.error.issues)
-        }],
-        isError: true
-      };
-    }
+    const data = await callJiraApi(endpoint, 'GET', {}, requestContext); // Using callJiraApi
     
-    const { issueKey, fields, expand } = parsed.data;
+    // Basic formatting, can be expanded
+    const formattedData = {
+      key: data.key,
+      summary: data.fields?.summary,
+      status: data.fields?.status?.name,
+      assignee: data.fields?.assignee?.displayName,
+      // Add more fields as needed or return raw data if requested
+      rawData: (fields === '*' || !fields) ? data : undefined // Example: show all if fields is '*' or not specified
+    };
     
-    // Build query parameters
-    const queryParams = new URLSearchParams();
-    if (fields) queryParams.append('fields', fields);
-    if (expand) queryParams.append('expand', expand);
-    
-    const endpoint = `/rest/api/3/issue/${issueKey}${queryParams.toString() ? '?' + queryParams.toString() : ''}`;
-    
-    try {
-      const data = await callJiraApi(endpoint);
-      
-      // Format response for better readability
-      const formattedData = {
-        key: data.key,
-        summary: data.fields?.summary,
-        description: data.fields?.description,
-        status: data.fields?.status?.name,
-        assignee: data.fields?.assignee?.displayName,
-        reporter: data.fields?.reporter?.displayName,
-        priority: data.fields?.priority?.name,
-        created: data.fields?.created,
-        updated: data.fields?.updated,
-        // Include other relevant fields based on the requested fields
-        rawData: fields === '*' ? data : undefined
-      };
-      
-      return {
-        content: [{
-          type: "text" as const,
-          text: JSON.stringify(formattedData, null, 2)
-        }]
-      };
-    } catch (err: any) {
-      return {
-        content: [{
-          type: "text" as const,
-          text: `Error fetching detailed Jira issue: ${err.message}`
-        }],
-        isError: true
-      };
-    }
+    return {
+      content: [{
+        type: "text" as const,
+        text: JSON.stringify(formattedData, null, 2)
+      }]
+    };
   } catch (err: any) {
     return {
       content: [{
         type: "text" as const,
-        text: `Exception in getDetailedJiraIssue: ${err.message}`
+        text: `Error fetching detailed Jira issue ${issueKey}: ${err.message}`
       }],
       isError: true
     };
@@ -322,7 +321,7 @@ export const getJiraIssueCommentsTool = {
 };
 
 // Executor
-export async function getJiraIssueCommentsExecutor(args: any, _extra: any) {
+export async function getJiraIssueCommentsExecutor(args: any, requestContext: RequestContext) {
   try {
     const parsed = getJiraIssueCommentsZodSchema.safeParse(args);
     if (!parsed.success) {
@@ -346,7 +345,7 @@ export async function getJiraIssueCommentsExecutor(args: any, _extra: any) {
     const endpoint = `/rest/api/3/issue/${issueKey}/comment${queryParams.toString() ? '?' + queryParams.toString() : ''}`;
     
     try {
-      const data = await callJiraApi(endpoint);
+      const data = await callJiraApi(endpoint, 'GET', {}, requestContext);
       
       // Format the comments for better readability
       const formattedComments = data.comments.map((comment: any) => ({
@@ -431,7 +430,7 @@ export const getJiraIssueTransitionsTool = {
 };
 
 // Executor
-export async function getJiraIssueTransitionsExecutor(args: any, _extra: any) {
+export async function getJiraIssueTransitionsExecutor(args: any, requestContext: RequestContext) {
   try {
     const parsed = getJiraIssueTransitionsZodSchema.safeParse(args);
     if (!parsed.success) {
@@ -453,7 +452,7 @@ export async function getJiraIssueTransitionsExecutor(args: any, _extra: any) {
     const endpoint = `/rest/api/3/issue/${issueKey}/transitions${queryParams.toString() ? '?' + queryParams.toString() : ''}`;
     
     try {
-      const data = await callJiraApi(endpoint);
+      const data = await callJiraApi(endpoint, 'GET', {}, requestContext);
       
       // Format the transitions for better readability
       const formattedTransitions = data.transitions.map((transition: any) => ({
@@ -566,7 +565,7 @@ export const searchJiraIssuesTool = {
 };
 
 // Executor
-export async function searchJiraIssuesExecutor(args: any, _extra: any) {
+export async function searchJiraIssuesExecutor(args: any, requestContext: RequestContext) {
   try {
     const parsed = searchJiraIssuesZodSchema.safeParse(args);
     if (!parsed.success) {
@@ -592,7 +591,7 @@ export async function searchJiraIssuesExecutor(args: any, _extra: any) {
     const endpoint = `/rest/api/3/search?${queryParams.toString()}`;
     
     try {
-      const data = await callJiraApi(endpoint);
+      const data = await callJiraApi(endpoint, 'GET', {}, requestContext);
       
       // Format the search results for better readability
       const formattedIssues = data.issues.map((issue: any) => ({
@@ -674,7 +673,7 @@ export const getJiraIssueWatchersTool = {
 };
 
 // Executor
-export async function getJiraIssueWatchersExecutor(args: any, _extra: any) {
+export async function getJiraIssueWatchersExecutor(args: any, requestContext: RequestContext) {
   try {
     const parsed = getJiraIssueWatchersZodSchema.safeParse(args);
     if (!parsed.success) {
@@ -692,7 +691,7 @@ export async function getJiraIssueWatchersExecutor(args: any, _extra: any) {
     const endpoint = `/rest/api/3/issue/${issueKey}/watchers`;
     
     try {
-      const data = await callJiraApi(endpoint);
+      const data = await callJiraApi(endpoint, 'GET', {}, requestContext);
       
       // Format the watchers for better readability
       const formattedWatchers = data.watchers.map((watcher: any) => ({
@@ -767,7 +766,7 @@ export const getJiraIssueAttachmentsTool = {
 };
 
 // Executor
-export async function getJiraIssueAttachmentsExecutor(args: any, _extra: any) {
+export async function getJiraIssueAttachmentsExecutor(args: any, requestContext: RequestContext) {
   try {
     const parsed = getJiraIssueAttachmentsZodSchema.safeParse(args);
     if (!parsed.success) {
@@ -786,7 +785,7 @@ export async function getJiraIssueAttachmentsExecutor(args: any, _extra: any) {
     const endpoint = `/rest/api/3/issue/${issueKey}?fields=attachment`;
     
     try {
-      const data = await callJiraApi(endpoint);
+      const data = await callJiraApi(endpoint, 'GET', {}, requestContext);
       
       // Make sure attachments exist in the response
       if (!data.fields || !data.fields.attachment) {
@@ -876,7 +875,7 @@ export const getJiraIssueSprintsTool = {
 };
 
 // Executor
-export async function getJiraIssueSprintsExecutor(args: any, _extra: any) {
+export async function getJiraIssueSprintsExecutor(args: any, requestContext: RequestContext) {
   try {
     const parsed = getJiraIssueSprintsZodSchema.safeParse(args);
     if (!parsed.success) {
@@ -895,7 +894,7 @@ export async function getJiraIssueSprintsExecutor(args: any, _extra: any) {
     const endpoint = `/rest/agile/1.0/issue/${issueKey}?fields=sprint,closedSprints,project`;
     
     try {
-      const data = await callJiraApi(endpoint);
+      const data = await callJiraApi(endpoint, 'GET', {}, requestContext);
       
       // Extract sprint information from the response
       const currentSprint = data.fields?.sprint ? {
@@ -950,5 +949,47 @@ export async function getJiraIssueSprintsExecutor(args: any, _extra: any) {
       }],
       isError: true
     };
+  }
+}
+
+// Example for a POST tool (addJiraComment)
+const addJiraCommentZodSchema = z.object({
+  issueKey: z.string().describe("The key of the issue to comment on."),
+  body: z.string().describe("The comment text."),
+});
+
+export const addJiraCommentPropertySchema = {
+  issueKey: { type: "string", description: "The key of the issue to comment on." },
+  body: { type: "string", description: "The comment text." }
+};
+
+export const addJiraCommentInputSchema = {
+  type: "object",
+  properties: {
+    issueKey: { type: "string", description: "The key of the issue to comment on." },
+    body: { type: "string", description: "The comment text." }
+  },
+  required: ["issueKey", "body"]
+};
+
+export const addJiraCommentTool = {
+  name: "addJiraComment",
+  description: "Adds a comment to a Jira issue.",
+};
+
+export async function addJiraCommentExecutor(args: any, requestContext: RequestContext) {
+  const parsed = addJiraCommentZodSchema.safeParse(args);
+  if (!parsed.success) {
+    return { content: [{ type: "text" as const, text: 'Invalid arguments: ' + JSON.stringify(parsed.error.issues) }], isError: true };
+  }
+  const { issueKey, body } = parsed.data;
+  const endpoint = `/rest/api/3/issue/${issueKey}/comment`;
+  const payload = { body: { type: "doc", version: 1, content: [{ type: "paragraph", content: [{ type: "text", text: body }] }] } }; // Jira Cloud comment format
+
+  try {
+    const data = await callJiraApi(endpoint, 'POST', { payload }, requestContext);
+    return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
+  } catch (err: any) {
+    return { content: [{ type: "text" as const, text: `Error adding comment to ${issueKey}: ${err.message}` }], isError: true };
   }
 } 

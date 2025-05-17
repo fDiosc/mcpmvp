@@ -9,6 +9,7 @@
  * - Summarizing all notes via a prompt
  */
 
+import './logger.js'; // This should be the very first import to ensure console is patched early.
 import express, { Request, Response } from "express";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
@@ -20,31 +21,25 @@ import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
 import { createAssistant, createThread, sendMessage, createAssistantWithMcpServer, createDynamicAssistant } from './client/agents/assistant.js';
 import { 
   getJiraIssueTool, 
-  getJiraIssueInputSchema, 
   getJiraIssueExecutor,
-  // Import new Jira tools
   getDetailedJiraIssueTool,
-  getDetailedJiraIssueInputSchema,
   getDetailedJiraIssueExecutor,
   getJiraIssueCommentsTool,
-  getJiraIssueCommentsInputSchema,
   getJiraIssueCommentsExecutor,
   getJiraIssueTransitionsTool,
-  getJiraIssueTransitionsInputSchema,
   getJiraIssueTransitionsExecutor,
   searchJiraIssuesTool,
-  searchJiraIssuesInputSchema,
   searchJiraIssuesExecutor,
   getJiraIssueWatchersTool,
-  getJiraIssueWatchersInputSchema,
   getJiraIssueWatchersExecutor,
   getJiraIssueAttachmentsTool,
-  getJiraIssueAttachmentsInputSchema,
   getJiraIssueAttachmentsExecutor,
   getJiraIssueSprintsTool,
-  getJiraIssueSprintsInputSchema,
-  getJiraIssueSprintsExecutor
+  getJiraIssueSprintsExecutor,
+  addJiraCommentTool,
+  addJiraCommentExecutor
 } from './jiraTool.js';
+import { UserJiraCredentials, RequestContext } from './types.js';
 import { BedrockRuntimeClient, InvokeModelCommand } from "@aws-sdk/client-bedrock-runtime";
 import dotenv from "dotenv";
 import fetch from 'node-fetch';
@@ -153,101 +148,82 @@ registerToolSelectionPrompt(server);
 registerNewsletterPrompt(server);
 registerReleaseNotePrompt(server);
 
-// Existing Jira tool registration
+// Module-scoped variable to hold context for the current /chat request (USE WITH EXTREME CAUTION - SEE COMMENTS)
+let currentChatRequestContext: RequestContext | null = null;
+
+// Helper function to safely extract RequestContext
+// TRYING THE MODULE-SCOPED HACK HERE
+function getRequestContextFromExtra(extra: any): RequestContext {
+  if (currentChatRequestContext) {
+    // console.warn('[getRequestContextFromExtra] Using currentChatRequestContext hack for user:', currentChatRequestContext.productLabUserId || 'N/A');
+    return currentChatRequestContext;
+  }
+  // Fallback if the hack isn't set (e.g., for tools called in other ways, or if 'extra' eventually contains it)
+  if (extra && typeof extra === 'object' && 'requestContext' in extra) {
+    // console.warn('[getRequestContextFromExtra] Found requestContext in extra parameter.');
+    return extra.requestContext as RequestContext;
+  }
+  // console.warn('[getRequestContextFromExtra] RequestContext not found. Jira tools might not use user-specific credentials if env vars are off.');
+  return {}; 
+}
+
+// MODIFIED Jira tool registration for get_jira_issue
 server.tool(
-  "get_jira_issue",
+  getJiraIssueTool.name, 
   {
     issueKey: z.string().describe("The Jira issue key or ID (e.g., 'PROJ-123')")
   },
-  async ({ issueKey }) => {
-    const jiraBaseUrl = process.env.JIRA_BASE_URL;
-    const jiraUser = process.env.JIRA_USERNAME;
-    const jiraToken = process.env.JIRA_API_TOKEN;
-    // Log das variáveis de ambiente (token mascarado)
-    console.error('[DEBUG][JIRA] JIRA_BASE_URL:', jiraBaseUrl);
-    console.error('[DEBUG][JIRA] JIRA_USERNAME:', jiraUser);
-    console.error('[DEBUG][JIRA] JIRA_API_TOKEN:', jiraToken ? jiraToken.slice(0, 4) + '...' : undefined);
-    if (!jiraBaseUrl || !jiraUser || !jiraToken) {
-      return {
-        content: [{
-          type: "text",
-          text: `Jira credentials are not configured in the environment.`
-        }]
-      };
-    }
-    const url = `${jiraBaseUrl}/rest/api/3/issue/${issueKey}`;
-    const auth = Buffer.from(`${jiraUser}:${jiraToken}`).toString('base64');
-    try {
-      const response = await fetch(url, {
-        headers: {
-          'Authorization': `Basic ${auth}`,
-          'Accept': 'application/json'
-        }
-      });
-      if (!response.ok) {
-        const errorText = await response.text();
-        return {
-          content: [{
-            type: "text",
-            text: `Error fetching Jira issue: ${response.status} ${response.statusText}\n${errorText}`
-          }]
-        };
-      }
-      const data = await response.json();
-      return {
-        content: [{
-          type: "text",
-          text: `Issue ${data.key}: ${data.fields.summary}\nStatus: ${data.fields.status.name}`
-        }]
-      };
-    } catch (err) {
-      return {
-        content: [{
-          type: "text",
-          text: `Error fetching Jira issue: ${err}`
-        }]
-      };
-    }
+  async (args, extra: any) => {
+    const requestContext = getRequestContextFromExtra(extra);
+    return getJiraIssueExecutor(args, requestContext);
   }
 );
 
-// New Jira tools registration
 // 1. Get Detailed Jira Issue
 server.tool(
-  "get_detailed_jira_issue",
+  getDetailedJiraIssueTool.name,
   {
     issueKey: z.string().describe("The key of the Jira issue (e.g., 'PROJ-123')"),
     fields: z.string().optional().describe("Comma-separated list of fields to return"),
     expand: z.string().optional().describe("Comma-separated list of entities to expand")
   },
-  getDetailedJiraIssueExecutor
+  async (args, extra: any) => {
+    const requestContext = getRequestContextFromExtra(extra);
+    return getDetailedJiraIssueExecutor(args, requestContext);
+  }
 );
 
 // 2. Get Jira Issue Comments
 server.tool(
-  "get_jira_issue_comments",
+  getJiraIssueCommentsTool.name,
   {
     issueKey: z.string().describe("The key of the Jira issue (e.g., 'PROJ-123')"),
     startAt: z.number().optional().describe("The index of the first item to return"),
     maxResults: z.number().optional().describe("The maximum number of items to return"),
     orderBy: z.string().optional().describe("Order of returned comments (e.g., 'created', '-created')")
   },
-  getJiraIssueCommentsExecutor
+  async (args, extra: any) => {
+    const requestContext = getRequestContextFromExtra(extra);
+    return getJiraIssueCommentsExecutor(args, requestContext);
+  }
 );
 
 // 3. Get Jira Issue Transitions
 server.tool(
-  "get_jira_issue_transitions",
+  getJiraIssueTransitionsTool.name,
   {
     issueKey: z.string().describe("The key of the Jira issue (e.g., 'PROJ-123')"),
     expand: z.string().optional().describe("Expand operations for the returned transitions")
   },
-  getJiraIssueTransitionsExecutor
+  async (args, extra: any) => {
+    const requestContext = getRequestContextFromExtra(extra);
+    return getJiraIssueTransitionsExecutor(args, requestContext);
+  }
 );
 
 // 4. Search Jira Issues with JQL
 server.tool(
-  "search_jira_issues",
+  searchJiraIssuesTool.name,
   {
     jql: z.string().describe("JQL search query (e.g., \"assignee = currentUser() AND status = 'In Progress'\")"),
     startAt: z.number().optional().describe("The index of the first item to return"),
@@ -255,35 +231,62 @@ server.tool(
     fields: z.string().optional().describe("Comma-separated list of fields to return"),
     expand: z.string().optional().describe("Comma-separated list of entities to expand")
   },
-  searchJiraIssuesExecutor
+  async (args, extra: any) => {
+    const requestContext = getRequestContextFromExtra(extra);
+    return searchJiraIssuesExecutor(args, requestContext);
+  }
 );
 
 // 5. Get Jira Issue Watchers
 server.tool(
-  "get_jira_issue_watchers",
+  getJiraIssueWatchersTool.name,
   {
     issueKey: z.string().describe("The key of the Jira issue (e.g., 'PROJ-123')")
   },
-  getJiraIssueWatchersExecutor
+  async (args, extra: any) => {
+    const requestContext = getRequestContextFromExtra(extra);
+    return getJiraIssueWatchersExecutor(args, requestContext);
+  }
 );
 
 // 6. Get Jira Issue Attachments
 server.tool(
-  "get_jira_issue_attachments",
+  getJiraIssueAttachmentsTool.name,
   {
     issueKey: z.string().describe("The key of the Jira issue (e.g., 'PROJ-123')")
   },
-  getJiraIssueAttachmentsExecutor
+  async (args, extra: any) => {
+    const requestContext = getRequestContextFromExtra(extra);
+    return getJiraIssueAttachmentsExecutor(args, requestContext);
+  }
 );
 
 // 7. Get Jira Issue Sprints
 server.tool(
-  "get_jira_issue_sprints",
+  getJiraIssueSprintsTool.name,
   {
     issueKey: z.string().describe("The key of the Jira issue (e.g., 'PROJ-123')")
   },
-  getJiraIssueSprintsExecutor
+  async (args, extra: any) => {
+    const requestContext = getRequestContextFromExtra(extra);
+    return getJiraIssueSprintsExecutor(args, requestContext);
+  }
 );
+
+// Example for addJiraCommentTool
+if (addJiraCommentTool && addJiraCommentExecutor) {
+  server.tool(
+    addJiraCommentTool.name,
+    {
+      issueKey: z.string().describe("The key of the issue to comment on."),
+      body: z.string().describe("The comment text.")
+    },
+    async (args, extra: any) => {
+      const requestContext = getRequestContextFromExtra(extra);
+      return addJiraCommentExecutor(args, requestContext);
+    }
+  );
+}
 
 const app = express();
 
@@ -447,11 +450,44 @@ async function callClaudeHaiku(messages: any[], tools: any[], sessionIdentifier:
   }
 }
 
-app.post('/chat', async (req: Request, res: Response) => {
+app.post('/chat', (async (req: Request, res: Response): Promise<void> => {
+  // Clear any previous request's context at the very start
+  currentChatRequestContext = null; 
+
+  const USE_ENV_FOR_JIRA_CREDENTIALS = process.env.USE_ENV_FOR_JIRA_CREDENTIALS === 'true';
+  let activeRequestContext: RequestContext = {}; 
+
+  if (!USE_ENV_FOR_JIRA_CREDENTIALS) {
+    const userJiraCreds = req.body.jiraAuth as UserJiraCredentials | undefined;
+    const productLabUserId = req.body.productLabUserId as string | undefined;
+
+    if (!userJiraCreds || !userJiraCreds.baseUrl || !userJiraCreds.username || !userJiraCreds.apiToken) {
+      console.error('[CHAT_ERROR] Dynamic Jira credentials required but not provided or incomplete.');
+      res.status(400).json({
+        error: "Jira_Credentials_Required",
+        message: "User Jira credentials are required. Please ensure jiraAuth: { baseUrl, username, apiToken } is sent."
+      });
+      return;
+    }
+    activeRequestContext.userJiraCredentials = userJiraCreds;
+    if (productLabUserId) {
+      activeRequestContext.productLabUserId = productLabUserId;
+    }
+    console.log(`[CHAT_INFO] Using dynamic Jira credentials for ProductLab user: ${productLabUserId || 'N/A'}`);
+  } else {
+    console.log('[CHAT_INFO] Using environment Jira credentials (USE_ENV_FOR_JIRA_CREDENTIALS=true).');
+  }
+
+  // SET THE MODULE-SCOPED VARIABLE for this request
+  currentChatRequestContext = activeRequestContext;
+
+  // (req as any).requestContext = activeRequestContext; // This line is less relevant if using the module-scoped hack
+
   try {
     const selectedModel = req.body.model || 'openai';
     const userInput = req.body.message;
-    console.error('[LOG][CHAT] Incoming request:', { model: selectedModel, message: userInput });
+    console.error('[LOG][CHAT] Incoming request:', { model: selectedModel, message: userInput, productLabUserId: activeRequestContext.productLabUserId });
+    
     if (!mcpClient) {
       const sseUrl = new URL('http://localhost:3333/mcp/sse');
       const transport = new SSEClientTransport(sseUrl);
@@ -460,19 +496,15 @@ app.post('/chat', async (req: Request, res: Response) => {
       console.error('[LOG][CHAT] MCP client connected');
     }
     
-    // Create dynamic tool client if not already created
     let dynamicToolClient = new DynamicToolClient(mcpClient);
-    // Create dynamic prompt client
     let dynamicPromptClient = new DynamicPromptClient(mcpClient);
     let mcpTools;
     let toolSelectionMethod = '';
     const enableContextFiltering = process.env.ENABLE_CONTEXT_FILTERING === 'true';
 
-    // Verifica se temos um prompt específico a ser usado
     let promptMessages = null;
     let systemPrompt = null;
 
-    // Verificar se temos um prompt contextual usando o cliente de prompts dinâmicos
     console.error('[LOG][CHAT] Checking for prompt context...');
     const promptResult = await dynamicPromptClient.getPromptFromMessage(userInput);
     
@@ -494,30 +526,23 @@ app.post('/chat', async (req: Request, res: Response) => {
       console.error('[LOG][CHAT] No specific prompt context detected, proceeding with normal flow');
     }
 
-    // PASSO 2: Detecção de Contexto para Tools
     if (enableContextFiltering) {
-      // 1. Tenta keyword mapping
       console.error('[LOG][CHAT] Analyzing user input for context detection (keyword mapping)...');
       const contexts = extractContextFromMessage(userInput);
       if (contexts.length > 0) {
-        // Context detected, load respective tools
         toolSelectionMethod = 'keyword';
         console.error(`[LOG][CHAT] [TOOL_SELECTION] Method: keyword | Context detected: ${contexts.join(', ')}`);
         mcpTools = await dynamicToolClient.getToolsFromMessage(userInput);
         console.error(`[LOG][CHAT] Loaded ${mcpTools.tools.length} tools for detected context`);
       } else {
-        // 2. Se não encontrou contexto, tenta seleção contextual via LLM
         toolSelectionMethod = 'contextual';
         console.error(`[LOG][CHAT] [TOOL_SELECTION] Method: contextual | No context detected, using LLM-assisted tool selection with model: ${selectedModel}`);
-        // Busca todas as ferramentas disponíveis
         const allTools = await dynamicToolClient.getTools({});
         const toolsText = allTools.tools.map((t: any) => `- ${t.name}: ${t.description}`).join('\n');
-        // Prompt para seleção contextual
         const promptText = `\nUsuário enviou a seguinte mensagem:\n"${userInput}"\n\nLista de ferramentas disponíveis:\n${toolsText}\n\nQuais ferramentas são relevantes para atender ao pedido do usuário?\nResponda apenas com uma lista de nomes de ferramentas, separados por vírgula.`;
         let llmResponse = '';
         try {
           if (selectedModel === 'openai') {
-            // OpenAI: precisa de thread e assistant
             if (!assistant) {
               assistant = await createDynamicAssistant(mcpClient);
               console.error('[LOG][CHAT] OpenAI assistant created with MCP tools as functions');
@@ -529,13 +554,11 @@ app.post('/chat', async (req: Request, res: Response) => {
             llmResponse = await sendMessage(mcpClient, thread.id, assistant.id, promptText);
             console.error('[LOG][CHAT] [TOOL_SELECTION] LLM (OpenAI) response for tool selection:', llmResponse);
           } else if (selectedModel === 'anthropic') {
-            // Claude API Direct
             const messages = [{ role: 'user' as const, content: [{ type: 'text' as const, text: promptText }] }];
             const response = await callClaudeDirectAPI(messages, [], undefined);
             llmResponse = response.content && Array.isArray(response.content) && response.content[0]?.type === 'text' ? response.content[0].text : '';
             console.error('[LOG][CHAT] [TOOL_SELECTION] LLM (Claude API Direct) response for tool selection:', llmResponse);
           } else if (selectedModel === 'bedrock') {
-            // Claude Bedrock
             const messages = [{ role: 'user', content: promptText }];
             const response = await callClaudeHaiku(messages, [], '');
             llmResponse = response?.content?.[0]?.text || '';
@@ -546,12 +569,10 @@ app.post('/chat', async (req: Request, res: Response) => {
         } catch (err) {
           console.error('[LOG][CHAT] [TOOL_SELECTION] Error calling LLM for tool selection:', err);
         }
-        // Parseia a resposta do LLM para obter os nomes das ferramentas
         let suggestedToolNames: string[] = [];
         if (llmResponse && typeof llmResponse === 'string') {
           suggestedToolNames = llmResponse.split(',').map(s => s.trim()).filter(Boolean);
         }
-        // Filtra as ferramentas sugeridas
         const relevantTools = allTools.tools.filter((t: any) => suggestedToolNames.includes(t.name));
         if (relevantTools.length > 0) {
           mcpTools = {
@@ -568,7 +589,6 @@ app.post('/chat', async (req: Request, res: Response) => {
           };
           console.error(`[LOG][CHAT] [TOOL_SELECTION] LLM selected ${relevantTools.length} tools: ${relevantTools.map((t: any) => t.name).join(', ')}`);
         } else {
-          // Se o LLM não sugeriu nada, envie array vazio de ferramentas
           toolSelectionMethod = 'contextual_none';
           mcpTools = {
             tools: [],
@@ -586,27 +606,23 @@ app.post('/chat', async (req: Request, res: Response) => {
         }
       }
     } else {
-      // Filtering disabled: always send all tools
       toolSelectionMethod = 'all/unfiltered';
       console.error('[LOG][CHAT] [TOOL_SELECTION] Method: all/unfiltered | Context filtering disabled, loading all tools');
       mcpTools = await dynamicToolClient.getTools({});
       console.error(`[LOG][CHAT] Loaded ${mcpTools.tools.length} tools (unfiltered)`);
     }
     
-    // Format tools for Bedrock Claude
     const toolsClaude = mcpTools.tools.map((tool: any) => ({
       name: tool.name,
       description: tool.description || `MCP tool: ${tool.name}`,
       input_schema: tool.inputSchema
     }));
     
-    // Track tokens for metrics
     if (mcpTools.tools.length > 0) {
       toolMetrics.trackToolTokens(mcpTools.tools, 'filtered');
     }
     
     if (selectedModel === 'openai') {
-      // OpenAI flow (using assistant and thread)
       if (!assistant) {
         assistant = await createDynamicAssistant(mcpClient);
         console.error('[LOG][CHAT] OpenAI assistant created with MCP tools as functions');
@@ -619,10 +635,8 @@ app.post('/chat', async (req: Request, res: Response) => {
       try {
         let response;
         if (promptMessages) {
-          // Se temos um prompt detectado, usamos ele
           console.error('[LOG][CHAT] Using detected prompt for OpenAI...');
           
-          // Enviamos cada mensagem do prompt para o thread
           for (const promptMessage of promptMessages) {
             const role = promptMessage.role || 'user';
             let content = '';
@@ -632,7 +646,6 @@ app.post('/chat', async (req: Request, res: Response) => {
             } else if (promptMessage.content.type === 'text') {
               content = promptMessage.content.text;
             } else {
-              // Para outros tipos de conteúdo, convertemos para string
               content = JSON.stringify(promptMessage.content);
             }
             
@@ -642,12 +655,10 @@ app.post('/chat', async (req: Request, res: Response) => {
             });
           }
           
-          // Executamos o assistente no thread
           const run = await openai.beta.threads.runs.create(thread.id, {
             assistant_id: assistant.id
           });
           
-          // Aguardamos a conclusão
           let completed = false;
           let runResult;
           
@@ -656,15 +667,16 @@ app.post('/chat', async (req: Request, res: Response) => {
             runResult = await openai.beta.threads.runs.retrieve(thread.id, run.id);
             console.log('[DEBUG][OPENAI][RUN STATUS]', runResult.status, runResult);
 
-            // Se o run requer ação de ferramenta
             if (runResult.status === 'requires_action' && runResult.required_action && runResult.required_action.submit_tool_outputs) {
               const toolCalls = runResult.required_action.submit_tool_outputs.tool_calls;
               const tool_outputs = [];
               for (const call of toolCalls) {
                 const toolName = call.function.name;
                 const args = JSON.parse(call.function.arguments);
-                console.log('[DEBUG][OPENAI][TOOL OUTPUTS][CALL]', toolName, args);
+                console.log('[DEBUG][OPENAI][TOOL OUTPUTS][CALL]', toolName, args, 'with context for (via hack):', currentChatRequestContext?.productLabUserId);
+                
                 const result = await mcpClient.callTool({ name: toolName, arguments: args });
+                
                 let output = '';
                 if (result?.content && Array.isArray(result.content) && result.content[0]?.text) {
                   output = result.content[0].text;
@@ -685,7 +697,6 @@ app.post('/chat', async (req: Request, res: Response) => {
             }
           }
           
-          // Obtemos as mensagens mais recentes
           const messages = await openai.beta.threads.messages.list(thread.id, {
             order: 'desc',
             limit: 1
@@ -703,40 +714,35 @@ app.post('/chat', async (req: Request, res: Response) => {
             }
           }
         } else {
-          // Fluxo normal sem prompt
           response = await sendMessage(mcpClient, thread.id, assistant.id, userInput);
         }
         
         console.error('[LOG][CHAT] OpenAI response received');
         res.json({ response });
+        return;
       } catch (err) {
         console.error('[OpenAI] Error in sendMessage:', err);
         res.status(500).json({ error: 'Erro ao processar mensagem com OpenAI.' });
+        return;
       }
     } else if (selectedModel === 'bedrock') {
-      // Bedrock Claude flow: use history from frontend if provided
       let messages = Array.isArray(req.body.history) ? req.body.history.slice() : [];
       
-      // Se detectamos um prompt, usamos ele
       if (promptMessages) {
         console.error('[LOG][CHAT] Using detected prompt for Bedrock Claude...');
         
-        // Converte as mensagens do prompt para o formato esperado pelo Bedrock
         messages = promptMessages.map(pm => {
           if (typeof pm.content === 'string') {
             return { role: pm.role, content: pm.content };
           } else if (pm.content.type === 'text') {
             return { role: pm.role, content: pm.content.text };
           } else {
-            // Para outros tipos de conteúdo, convertemos para string
             return { role: pm.role, content: JSON.stringify(pm.content) };
           }
         });
       } else if (messages.length === 0) {
-        // Se não temos histórico nem prompt, usamos apenas a mensagem do usuário
         messages = [{ role: "user", content: userInput }];
       } else if (messages.length > 0 && messages[messages.length - 1].role !== 'user') {
-        // Se a última mensagem no histórico não é do usuário, adicionamos a atual
         messages.push({ role: "user", content: userInput });
       }
       
@@ -748,9 +754,7 @@ app.post('/chat', async (req: Request, res: Response) => {
       while (!finished && recursion < MAX_RECURSION) {
         let response;
         try {
-          // Antes de chamar Claude, garanta que a última mensagem não é do assistente
           if (messages.length > 0 && messages[messages.length - 1].role === 'assistant') {
-            // Não é permitido enviar para Claude, finalize o loop
             break;
           }
           console.error('[LOG][CHAT] Calling Claude with:', { messages, toolsClaude });
@@ -769,7 +773,7 @@ app.post('/chat', async (req: Request, res: Response) => {
               finalTexts.push(block.text);
               messages.push({ role: "assistant", content: block.text });
             } else if (block.type === "tool_use") {
-              console.error('[LOG][CHAT] Tool use detected:', block);
+              console.error('[LOG][CHAT] Tool use detected:', block, 'with context for (via hack):', currentChatRequestContext?.productLabUserId);
               try {
                 const toolResult = await mcpClient.callTool({ name: block.name, arguments: block.input });
                 console.error('[LOG][CHAT] MCP tool result:', toolResult);
@@ -779,7 +783,6 @@ app.post('/chat', async (req: Request, res: Response) => {
                 } else {
                   toolResultContent = [{ type: 'text', text: JSON.stringify(toolResult) }];
                 }
-                // PATCH: Envia o resultado da tool como mensagem 'user' com JSON estruturado
                 let toolResultPayload;
                 if (toolResult && typeof toolResult === 'object') {
                   toolResultPayload = JSON.stringify(toolResult);
@@ -805,7 +808,6 @@ app.post('/chat', async (req: Request, res: Response) => {
         } else {
           finished = true;
         }
-        // Se a última mensagem for do assistente, não chame Claude novamente
         if (messages.length > 0 && messages[messages.length - 1].role === 'assistant') {
           break;
         }
@@ -814,55 +816,47 @@ app.post('/chat', async (req: Request, res: Response) => {
       const finalText = finalTexts.join('\n');
       console.error('[LOG][CHAT] Final response to frontend:', finalText);
       res.json({ response: finalText });
+      return;
     } else if (selectedModel === 'anthropic') {
-      // Claude via API direta da Anthropic
       console.error('[LOG][CHAT] Using direct Anthropic API integration');
       
       const userInputText = typeof req.body.message === 'string' ? req.body.message : JSON.stringify(req.body.message);
 
-      // Initialize currentTurnMessages: Start with client-provided history, or empty if none.
       let currentTurnMessages: CustomAnthropicMessage[] = [];
       const providedHistory = req.body.history || [];
 
       if (Array.isArray(providedHistory) && providedHistory.length > 0) {
         console.error('[LOG][ANTHROPIC] Initializing with history provided by client.');
-        // Deep copy to avoid modifying client's original history object if it's passed by reference elsewhere
         currentTurnMessages = JSON.parse(JSON.stringify(providedHistory));
       }
 
-      // Add current user input as a new message.
-      // Ensure content is an array of blocks as per CustomAnthropicMessage.
       currentTurnMessages.push({ 
         role: 'user' as const, 
         content: [{ type: 'text' as const, text: userInputText }] 
       });
       
-      // Usamos um ID de sessão consistente para benefícios de cache com a Anthropic
       const clientId = req.body.sessionId || `jira-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
       console.error(`[LOG][ANTHROPIC] Usando ID de sessão para cache: ${clientId}`);
       
       const anthropicTools = convertMcpToolsToAnthropicFormat(mcpTools.tools);
       let finished = false;
       let recursion = 0;
-      const MAX_RECURSION = 5; // Max tool uses per turn
-      let apiResponseObject: any; // To store the full API response object from Claude
+      const MAX_RECURSION = 5;
+      let apiResponseObject: any;
       
-      // Tracking previous tool calls to prevent loops - use a more robust signature
       const toolCallTracker = new Set<string>(); 
       
       try {
-        // Loop de processamento de ferramentas
         while (!finished && recursion < MAX_RECURSION) {
           console.error(`[LOG][ANTHROPIC] Chamada para Claude API (iteração ${recursion + 1}/${MAX_RECURSION})`);
           
           apiResponseObject = await callClaudeDirectAPI(
-            currentTurnMessages, // Pass the meticulously built history
+            currentTurnMessages,
             anthropicTools,
             clientId,
-            systemPrompt as string | undefined // Assuming systemPrompt is defined elsewhere or undefined
+            systemPrompt as string | undefined
           );
           
-          // Add assistant's response (which might include text and tool_use) to history
           const assistantResponseContent: CustomContentBlock[] = (apiResponseObject.content || [])
             .map((block: any): CustomContentBlock | null => {
               if (block.type === 'text') return { type: 'text', text: block.text } as CustomContentBlock;
@@ -877,19 +871,16 @@ app.post('/chat', async (req: Request, res: Response) => {
               content: assistantResponseContent,
             });
           } else if (apiResponseObject.stop_reason === 'end_turn' && !apiResponseObject.content?.some((b:any) => b.type === 'text')) {
-            // Handle cases where Anthropic might return an empty content array on end_turn (e.g. after only tool calls)
-            // Push a minimal assistant message if needed to signify turn completion if no text part.
-             currentTurnMessages.push({role: 'assistant', content: [{type: 'text', text: ""}] }); // Or handle appropriately
+            currentTurnMessages.push({role: 'assistant', content: [{type: 'text', text: ""}] });
           }
 
-
           if (apiResponseObject.stop_reason === 'tool_use') {
-            finished = false; // Not finished, Claude wants to use tools
+            finished = false;
             const toolUseBlocks = assistantResponseContent.filter(block => block.type === 'tool_use');
             
             if (!toolUseBlocks || toolUseBlocks.length === 0) {
               console.error("[LOG][ANTHROPIC] Stop reason is tool_use, but no tool_use blocks found in content. Breaking.");
-              finished = true; // Avoid infinite loop
+              finished = true;
               break;
             }
 
@@ -924,19 +915,17 @@ app.post('/chat', async (req: Request, res: Response) => {
                 let resultStringContent: string;
 
                 if (executionResult && executionResult.content && Array.isArray(executionResult.content) && executionResult.content.length > 0) {
-                  // Prefer text if available, otherwise stringify the first content block
                   resultStringContent = executionResult.content[0].text || JSON.stringify(executionResult.content[0]);
                 } else if (typeof executionResult.content === 'string') {
                   resultStringContent = executionResult.content;
                 } else {
-                  resultStringContent = JSON.stringify(executionResult); // Fallback
+                  resultStringContent = JSON.stringify(executionResult);
                 }
                 
                 toolResultsForThisTurn.push({
                   type: 'tool_result',
                   tool_use_id: toolUseBlock.id,
-                  content: resultStringContent, // Anthropic expects string or [{type: 'text', text: '...'}]
-                                               // If resultStringContent could be very large, consider if it should be structured
+                  content: resultStringContent
                 });
               } catch (toolExecError: any) {
                 console.error(`[ERROR][ANTHROPIC] Erro ao executar ferramenta ${toolUseBlock.name}:`, toolExecError);
@@ -950,32 +939,26 @@ app.post('/chat', async (req: Request, res: Response) => {
 
             if (toolResultsForThisTurn.length > 0) {
               currentTurnMessages.push({
-                role: 'user', // This message contains results OF tools requested by assistant
+                role: 'user',
                 content: toolResultsForThisTurn,
               });
             }
-            // Ensure we don't fall into an immediate loop if all tool calls were duplicates/errors
             if (toolResultsForThisTurn.every(tr => (tr as any).is_error && toolCallTracker.has(`${(toolUseBlocks.find(tu => tu.id === tr.tool_use_id) || {}).name}_${JSON.stringify((toolUseBlocks.find(tu => tu.id === tr.tool_use_id) || {}).input || {})}`))) {
-                // If all tools resulted in errors because they were duplicates that were already tracked,
-                // we might be in a loop. Better to break.
                 console.warn("[LOG][ANTHROPIC] All tool calls in this step were duplicate errors. Breaking to prevent loop.");
                 finished = true;
             }
 
           } else {
-            // If stop_reason is 'end_turn' or other reasons like 'max_tokens'
             finished = true;
             console.error(`[LOG][ANTHROPIC] Processamento concluído por Claude, motivo: ${apiResponseObject.stop_reason}`);
           }
           recursion++;
-        } // End of while loop for tool processing
+        }
 
         if (recursion >= MAX_RECURSION) {
           console.warn("[LOG][ANTHROPIC] Max recursion depth reached for tool processing.");
-          // Potentially add a message to currentTurnMessages indicating this
         }
 
-        // Extract final text response for the client
         let finalResponseText = '';
         const lastAssistantMsg = currentTurnMessages.filter(m => m.role === 'assistant').pop();
         if (lastAssistantMsg && Array.isArray(lastAssistantMsg.content)) {
@@ -983,126 +966,118 @@ app.post('/chat', async (req: Request, res: Response) => {
             .filter((c: CustomContentBlock) => c.type === 'text' && c.text)
             .map((c: CustomContentBlock) => c.text)
             .join('\n');
-        } else if (lastAssistantMsg && typeof lastAssistantMsg.content === 'string') { // Should be rare with current block logic
+        } else if (lastAssistantMsg && typeof lastAssistantMsg.content === 'string') {
             finalResponseText = lastAssistantMsg.content;
         }
         
-        // If the very last message from assistant was tool_use and we broke loop,
-        // finalResponseText might be empty. Client should handle this.
-        // Or, provide a default message.
         if (!finalResponseText && apiResponseObject && apiResponseObject.stop_reason !== 'end_turn') {
             finalResponseText = "[O assistente terminou de usar ferramentas, mas não forneceu uma mensagem de texto final.]";
         }
 
-
         console.error('[LOG][CHAT] Final response to frontend:', { text: finalResponseText, historyLength: currentTurnMessages.length });
         res.json({ 
           response: finalResponseText,
-          history: currentTurnMessages // Send the meticulously constructed history back
+          history: currentTurnMessages
         });
+        return;
 
       } catch (err: any) {
         console.error('[ERROR][ANTHROPIC_CHAT_HANDLER]', err);
-        // Handle the specific error for recovery, if applicable from previous logs
         if (err.status === 400 && err.error?.error?.message?.includes("unexpected `tool_use_id`")) {
              console.error('[LOG][ANTHROPIC] Detectado erro de estrutura (400) na API Anthropic. O histórico pode estar malformado.');
-             // The recovery logic with new conversation ID is now less preferred
-             // as history should be built correctly. This error should ideally not happen.
         }
         res.status(err.status || 500).json({ error: `Erro ao processar mensagem com Anthropic (Direto): ${err.message}` });
+        return;
       }
     } else {
       console.error('[Server] Modelo não suportado:', selectedModel);
       res.status(400).json({ error: 'Modelo não suportado.' });
+      return;
     }
   } catch (err: any) {
     console.error('[Server] Unhandled error in /chat:', err);
     res.status(500).json({ error: err.message });
+    return;
+  } finally {
+    // CRITICAL: Clear the module-scoped variable after the request is processed
+    currentChatRequestContext = null;
   }
-});
+}) as any); // Cast to any to bypass the stubborn linter error for now
 
 // Add new endpoint for dynamic tool discovery
 app.get('/tools', (req: Request, res: Response) => {
   try {
     const enableContextFiltering = process.env.ENABLE_CONTEXT_FILTERING === 'true';
-    // Extract query parameters (for future filtering)
     const context = req.query.context as string | undefined;
     const category = req.query.category as string | undefined;
     const userId = req.query.userId as string | undefined;
     
-    // Log the request
     console.error(`[LOG][TOOLS] Tool discovery request received: context=${context}, category=${category}, userId=${userId}`);
     
-    // Get all tools from the MCP server
-    // Since the McpServer API doesn't have a public way to directly access all tools,
-    // we'll build the list from the available tool names in the server.
     const allTools: any[] = [];
     
-    // Get all tools registered with the server by name and construct tool objects
     const toolNames = [
       'create_note',
-      'get_jira_issue',
-      'get_detailed_jira_issue',
-      'get_jira_issue_comments',
-      'get_jira_issue_transitions',
-      'search_jira_issues',
-      'get_jira_issue_watchers',
-      'get_jira_issue_attachments',
-      'get_jira_issue_sprints'
+      getJiraIssueTool.name,
+      getDetailedJiraIssueTool.name,
+      getJiraIssueCommentsTool.name,
+      getJiraIssueTransitionsTool.name,
+      searchJiraIssuesTool.name,
+      getJiraIssueWatchersTool.name,
+      getJiraIssueAttachmentsTool.name,
+      getJiraIssueSprintsTool.name
     ];
     
-    // Add tool categories and contexts for filtering in Phase 2
-    const toolMetadata: Record<string, { description: string, contexts: string[], categories: string[] }> = {
+    const defaultToolMetadata: Record<string, { description: string; contexts: string[]; categories: string[] }> = {
       'create_note': {
-        description: 'Create a new note with title and content',
-        contexts: ['notes', 'writing', 'document', 'text'],
+        description: 'Create a new text note with a title and content',
+        contexts: ['notes', 'text', 'create', 'new', 'information storage'],
         categories: ['creation', 'notes']
       },
-      'get_jira_issue': {
+      [getJiraIssueTool.name]: {
         description: 'Get basic information about a Jira issue',
         contexts: ['jira', 'tickets', 'project management', 'issue tracking'],
         categories: ['jira', 'retrieval']
       },
-      'get_detailed_jira_issue': {
+      [getDetailedJiraIssueTool.name]: {
         description: 'Get detailed information about a Jira issue',
         contexts: ['jira', 'tickets', 'project management', 'issue tracking', 'details'],
         categories: ['jira', 'retrieval', 'details']
       },
-      'get_jira_issue_comments': {
+      [getJiraIssueCommentsTool.name]: {
         description: 'Get comments from a Jira issue',
         contexts: ['jira', 'tickets', 'comments', 'communication', 'discussion'],
         categories: ['jira', 'comments', 'communication']
       },
-      'get_jira_issue_transitions': {
+      [getJiraIssueTransitionsTool.name]: {
         description: 'Get available transitions for a Jira issue',
         contexts: ['jira', 'workflow', 'status', 'transitions'],
         categories: ['jira', 'workflow', 'status']
       },
-      'search_jira_issues': {
+      [searchJiraIssuesTool.name]: {
         description: 'Search for Jira issues using JQL',
         contexts: ['jira', 'search', 'query', 'filter', 'find'],
         categories: ['jira', 'search', 'query']
       },
-      'get_jira_issue_watchers': {
+      [getJiraIssueWatchersTool.name]: {
         description: 'Get watchers of a Jira issue',
         contexts: ['jira', 'watchers', 'users', 'notifications'],
         categories: ['jira', 'users', 'watchers']
       },
-      'get_jira_issue_attachments': {
+      [getJiraIssueAttachmentsTool.name]: {
         description: 'Get attachments of a Jira issue',
         contexts: ['jira', 'attachments', 'files', 'documents'],
         categories: ['jira', 'attachments', 'files']
       },
-      'get_jira_issue_sprints': {
+      [getJiraIssueSprintsTool.name]: {
         description: 'Get sprints associated with a Jira issue',
         contexts: ['jira', 'sprints', 'agile', 'scrum'],
         categories: ['jira', 'sprints', 'agile']
       }
     };
     
-    // Build the tool objects with metadata
     for (const name of toolNames) {
-      const metadata = toolMetadata[name] || { 
+      const metadata = defaultToolMetadata[name] || { 
         description: `Tool: ${name}`,
         contexts: [],
         categories: []
@@ -1111,14 +1086,13 @@ app.get('/tools', (req: Request, res: Response) => {
       allTools.push({
         name,
         description: metadata.description,
-        inputSchema: {}, // We can't easily retrieve the actual input schema here
+        inputSchema: {},
         contexts: metadata.contexts,
         categories: metadata.categories
       });
     }
     
     if (!enableContextFiltering) {
-      // Filtering disabled: always return all tools
       console.error('[LOG][TOOLS] Context filtering disabled, returning all tools');
       res.json({
         tools: allTools,
@@ -1138,7 +1112,6 @@ app.get('/tools', (req: Request, res: Response) => {
     let filteredTools = allTools;
     if (enableContextFiltering && context) {
       filteredTools = allTools.filter(tool => {
-        // Match by context if provided
         return tool.contexts.some((c: string) => 
           context.toLowerCase().split(',').some(contextPart => 
             c.toLowerCase().includes(contextPart.trim()) || 
@@ -1148,7 +1121,6 @@ app.get('/tools', (req: Request, res: Response) => {
       });
     }
     
-    // If no tools match the context, return empty array
     if (filteredTools.length === 0) {
       console.error(`[LOG][TOOLS] No matching tools found for context: ${context}`);
       res.json({
@@ -1166,7 +1138,6 @@ app.get('/tools', (req: Request, res: Response) => {
       return;
     }
     
-    // Additional category filtering if specified
     if (category) {
       filteredTools = filteredTools.filter(tool => {
         return tool.categories.some((c: string) => 
@@ -1175,6 +1146,7 @@ app.get('/tools', (req: Request, res: Response) => {
         );
       });
     }
+    
     
     // Track metrics
     if (filteredTools.length < allTools.length) {

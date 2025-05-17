@@ -24,11 +24,13 @@
     "@anthropic-ai/sdk": "^0.40.1",
     "@aws-sdk/client-bedrock-runtime": "^3.500.0",
     "@modelcontextprotocol/sdk": "^1.11.0",
+    "@prisma/client": "^6.7.0",
     "@timbreeding/jira-mcp-server": "latest",
     "dotenv": "^16.5.0",
     "express": "^5.1.0",
     "node-fetch": "^2.6.7",
     "openai": "^4.97.0",
+    "prisma": "^6.7.0",
     "puppeteer": "^24.8.0",
     "uuid": "^9.0.1"
   },
