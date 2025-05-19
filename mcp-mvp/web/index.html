@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <title>Chat MCP + Notas</title>
+  <style>
+    body { font-family: sans-serif; max-width: 600px; margin: 2em auto; }
+    #chat { border: 1px solid #ccc; padding: 1em; min-height: 200px; margin-bottom: 1em; overflow-y: auto; max-height: 400px; }
+    #notas { border: 1px solid #ccc; padding: 1em; margin-top: 2em; }
+    .msg { margin: 0.5em 0; }
+    .user { color: #1976d2; }
+    .bot { color: #388e3c; }
+    #model-selector { margin-right: 10px; padding: 5px; }
+    .loading-indicator { color: #888; font-style: italic; }
+    #available-prompts { border: 1px solid #ccc; padding: 1em; margin-top: 2em; }
+    .prompt-btn { margin: 5px; padding: 5px 10px; cursor: pointer; }
+    .prompt-info { font-size: 0.8em; color: #666; margin-top: 5px; }
+  </style>
+</head>
+<body>
+  <h1>Chat com Agente MCP</h1>
+  <div id="chat"></div>
+  <form id="form">
+    <input id="input" autocomplete="off" placeholder="Digite sua mensagem..." style="width:60%" />
+    <select id="model-selector">
+      <option value="openai">OpenAI</option>
+      <option value="bedrock">Claude (Bedrock)</option>
+      <option value="anthropic">Claude (API Direct)</option>
+    </select>
+    <button type="submit">Enviar</button>
+  </form>
+
+  <div id="available-prompts">
+    <h2>Prompts Disponíveis</h2>
+    <div id="prompt-buttons"></div>
+    <p class="prompt-info">Os prompts acima são sistemas de mensagens pré-definidas para facilitar tarefas específicas. 
+    Peça por eles diretamente, como "Crie uma newsletter sobre a nova funcionalidade" ou 
+    "Gere uma nota de lançamento para a versão 2.0".</p>
+  </div>
+
+  <div id="notas">
+    <h2>Notas Criadas</h2>
+    <ul id="lista-notas"></ul>
+    <button onclick="carregarNotas()">Atualizar Notas</button>
+  </div>
+
+  <script>
+    const chat = document.getElementById('chat');
+    const form = document.getElementById('form');
+    const input = document.getElementById('input');
+    const listaNotas = document.getElementById('lista-notas');
+    const promptButtons = document.getElementById('prompt-buttons');
+    let messageHistory = [];
+    let anthropicHistory = []; // Separate history for Anthropic API
+
+    form.onsubmit = async (e) => {
+      e.preventDefault();
+      const msg = input.value.trim();
+      if (!msg) return;
+      
+      const model = document.getElementById('model-selector').value;
+      chat.innerHTML += `<div class='msg user'><b>Você:</b> ${msg}</div>`;
+      
+      // Add loading indicator
+      const loadingMsgId = 'loading-' + Date.now();
+      chat.innerHTML += `<div id="${loadingMsgId}" class='msg bot loading-indicator'><b>Agente:</b> Processando...</div>`;
+      
+      input.value = '';
+      chat.scrollTop = chat.scrollHeight;
+      
+      let resposta = 'Erro ao obter resposta do agente.';
+      try {
+        let body;
+        
+        if (model === 'bedrock') {
+          // Para Claude Bedrock, mantenha o histórico simples
+          messageHistory.push({ role: 'user', content: msg });
+          body = JSON.stringify({ message: msg, model, history: messageHistory });
+        } else if (model === 'anthropic') {
+          // Para Claude API Direct, use o histórico dedicado
+          body = JSON.stringify({ message: msg, model, history: anthropicHistory });
+        } else {
+          // Para OpenAI, mantenha o fluxo sem histórico
+          body = JSON.stringify({ message: msg, model });
+        }
+        
+        const res = await fetch('/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body
+        });
+        
+        const data = await res.json();
+        resposta = data.response || data.error || 'Erro ao obter resposta do agente.';
+        
+        // Update history based on model
+        if (model === 'bedrock') {
+          messageHistory.push({ role: 'assistant', content: resposta });
+        } else if (model === 'anthropic') {
+          // For Anthropic, the backend returns the updated history
+          if (data.history) {
+            anthropicHistory = data.history;
+          } else {
+            // Fallback if no history returned
+            anthropicHistory.push({ role: 'user', content: msg });
+            anthropicHistory.push({ role: 'assistant', content: resposta });
+          }
+        }
+      } catch (e) {
+        console.error('Error in chat submission:', e);
+        resposta = 'Erro ao conectar ao backend.';
+      }
+      
+      // Remove loading indicator and add actual response
+      const loadingElem = document.getElementById(loadingMsgId);
+      if (loadingElem) {
+        loadingElem.remove();
+      }
+      
+      chat.innerHTML += `<div class='msg bot'><b>Agente:</b> ${resposta}</div>`;
+      chat.scrollTop = chat.scrollHeight;
+    };
+
+    // Model selector change handler - reset history when changing models
+    document.getElementById('model-selector').addEventListener('change', function() {
+      const confirmed = confirm("Mudar o modelo vai resetar o histórico da conversa. Deseja continuar?");
+      if (confirmed) {
+        messageHistory = [];
+        anthropicHistory = [];
+        chat.innerHTML = '<div class="msg bot"><b>Sistema:</b> Modelo trocado, histórico limpo.</div>';
+      } else {
+        // Revert selection
+        this.value = this.getAttribute('data-last-value') || 'openai';
+      }
+      // Store current selection
+      this.setAttribute('data-last-value', this.value);
+    });
+
+    // Carregar prompts disponíveis
+    async function carregarPrompts() {
+      try {
+        const res = await fetch('/prompts/list');
+        const prompts = await res.json();
+        
+        promptButtons.innerHTML = '';
+        
+        if (prompts.length === 0) {
+          promptButtons.innerHTML = '<p>Nenhum prompt disponível.</p>';
+        } else {
+          prompts.forEach(prompt => {
+            const btn = document.createElement('button');
+            btn.className = 'prompt-btn';
+            btn.textContent = prompt.name;
+            btn.title = prompt.description;
+            
+            btn.onclick = () => {
+              insertPromptExample(prompt.name);
+            };
+            
+            promptButtons.appendChild(btn);
+          });
+        }
+      } catch (e) {
+        console.error('Erro ao carregar prompts:', e);
+        promptButtons.innerHTML = '<p>Erro ao carregar prompts.</p>';
+      }
+    }
+    
+    // Função para inserir exemplos de uso de prompts
+    function insertPromptExample(promptName) {
+      let example = '';
+      
+      switch (promptName) {
+        case 'newsletter_post':
+          example = 'Crie uma newsletter sobre o novo sistema de prompts contextuais';
+          break;
+        case 'release_note':
+          example = 'Gere uma nota de lançamento para a versão 2.0 com suporte a prompts contextuais';
+          break;
+        case 'summarize_notes':
+          example = 'Resuma todas as notas que temos no sistema';
+          break;
+        case 'tool_selection':
+          example = 'Quais ferramentas posso usar para gerenciar notas?';
+          break;
+        default:
+          example = `Utilize o prompt ${promptName}`;
+      }
+      
+      input.value = example;
+      input.focus();
+    }
+
+    async function carregarNotas() {
+      listaNotas.innerHTML = '<li>Carregando...</li>';
+      try {
+        const res = await fetch('/notas');
+        const notas = await res.json();
+        if (notas.length === 0) {
+          listaNotas.innerHTML = '<li>Nenhuma nota criada ainda.</li>';
+        } else {
+          listaNotas.innerHTML = notas.map(n => `<li><b>${n.title}</b>: ${n.content}</li>`).join('');
+        }
+      } catch (e) {
+        listaNotas.innerHTML = '<li>Erro ao carregar notas.</li>';
+      }
+    }
+    
+    // Carregar dados iniciais
+    carregarNotas();
+    carregarPrompts();
+  </script>
+</body>
+</html> 

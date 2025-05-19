@@ -12,8 +12,9 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
  * Detecta quais prompts são relevantes com base na mensagem do usuário
  * @param message A mensagem do usuário
  * @param mcpClient O cliente MCP para acessar prompts
+ * @param selectedModel O modelo selecionado para detecção de prompts
  */
-export async function detectPromptsFromMessage(message: string, mcpClient: any): Promise<{ promptName: string; params: any } | null> {
+export async function detectPromptsFromMessage(message: string, mcpClient: any, selectedModel: string): Promise<{ promptName: string; params: any } | null> {
   if (!message || typeof message !== 'string') {
     console.error('[LOG][PROMPT_CONTEXT] Invalid message received:', message);
     return null;
@@ -48,55 +49,49 @@ export async function detectPromptsFromMessage(message: string, mcpClient: any):
     `- ${prompt.name}: ${prompt.description || `Prompt para ${prompt.name}`}`
   ).join('\n');
   
-  // Decide qual modelo usar para a seleção de prompts
-  // Prefira usar um modelo mais leve/rápido para esta decisão
-  const promptSelectionModel = "claude-3-5-haiku-20241022"; // Ou qualquer modelo que preferir
-  
   // Prompt para o LLM selecionar o prompt correto
-  const promptText = `
-Usuário enviou a seguinte mensagem:
-"${message}"
+  const promptText = `\nUsuário enviou a seguinte mensagem:\n"${message}"\n\nLista de prompts disponíveis:\n${promptDescriptions}\n\nCom base na mensagem do usuário, qual dos prompts acima é mais adequado para atender ao pedido?\nSe nenhum prompt for adequado, responda "nenhum".\nResponda apenas com o nome do prompt sem explicações adicionais. \nSe for necessário extrair algum parâmetro da mensagem do usuário para o prompt, liste-os no formato JSON após o nome do prompt.\n\nExemplo de resposta para seleção do prompt newsletter_post:\nnewsletter_post{"feature":"AI Assistant", "context":"Technical users"}\n`;
 
-Lista de prompts disponíveis:
-${promptDescriptions}
-
-Com base na mensagem do usuário, qual dos prompts acima é mais adequado para atender ao pedido?
-Se nenhum prompt for adequado, responda "nenhum".
-Responda apenas com o nome do prompt sem explicações adicionais. 
-Se for necessário extrair algum parâmetro da mensagem do usuário para o prompt, liste-os no formato JSON após o nome do prompt.
-
-Exemplo de resposta para seleção do prompt newsletter_post:
-newsletter_post{"feature":"AI Assistant", "context":"Technical users"}
-`;
-
-  // Chama o LLM para fazer a seleção de prompt
-  const anthropic = new Anthropic({
-    apiKey: process.env.ANTHROPIC_API_KEY || '',
-  });
-  
+  let llmResponse = '';
   try {
-    const response = await anthropic.messages.create({
-      model: promptSelectionModel,
-      max_tokens: 150,
-      messages: [
-        { role: "user", content: promptText }
-      ],
-      temperature: 0.2,  // Baixa temperatura para decisões mais determinísticas
-    });
-    
-    // Fix for Anthropic API response format
-    let llmResponse = '';
-    if (response.content && Array.isArray(response.content) && response.content.length > 0) {
-      const contentBlock = response.content[0];
-      if (contentBlock.type === 'text') {
-        llmResponse = contentBlock.text.trim();
+    if (selectedModel === 'openai') {
+      // Use OpenAI completions endpoint para seleção de prompt
+      const { OpenAI } = await import('openai');
+      const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+      const completion = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: [
+          { role: 'system', content: 'Você é um assistente que seleciona prompts para tarefas.' },
+          { role: 'user', content: promptText }
+        ],
+        max_tokens: 100,
+        temperature: 0.2
+      });
+      llmResponse = completion.choices[0]?.message?.content?.trim() || '';
+    } else {
+      // Default: Anthropic/Claude
+      const Anthropic = (await import('@anthropic-ai/sdk')).default;
+      const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY || '' });
+      const response = await anthropic.messages.create({
+        model: 'claude-3-5-haiku-20241022',
+        max_tokens: 150,
+        messages: [
+          { role: 'user', content: promptText }
+        ],
+        temperature: 0.2
+      });
+      if (response.content && Array.isArray(response.content) && response.content.length > 0) {
+        const contentBlock = response.content[0];
+        if (contentBlock.type === 'text') {
+          llmResponse = contentBlock.text.trim();
+        } else {
+          console.error('[LOG][PROMPT_CONTEXT] Unexpected content type:', contentBlock.type);
+          return null;
+        }
       } else {
-        console.error('[LOG][PROMPT_CONTEXT] Unexpected content type:', contentBlock.type);
+        console.error('[LOG][PROMPT_CONTEXT] No content in LLM response');
         return null;
       }
-    } else {
-      console.error('[LOG][PROMPT_CONTEXT] No content in LLM response');
-      return null;
     }
     
     console.error('[LOG][PROMPT_CONTEXT] LLM response for prompt selection:', llmResponse);
@@ -151,14 +146,14 @@ export class DynamicPromptClient {
   /**
    * Detecta e obtém o prompt adequado com base na mensagem do usuário
    */
-  async getPromptFromMessage(message: string): Promise<{ 
+  async getPromptFromMessage(message: string, selectedModel: string): Promise<{ 
     promptContent: any; 
     promptName: string;
     shouldAppend: boolean;
     system?: string;
   } | null> {
     // Detecta qual prompt usar
-    const promptDetection = await detectPromptsFromMessage(message, this.client);
+    const promptDetection = await detectPromptsFromMessage(message, this.client, selectedModel);
     
     if (!promptDetection) {
       return null;

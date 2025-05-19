@@ -506,7 +506,7 @@ app.post('/chat', (async (req: Request, res: Response): Promise<void> => {
     let systemPrompt = null;
 
     console.error('[LOG][CHAT] Checking for prompt context...');
-    const promptResult = await dynamicPromptClient.getPromptFromMessage(userInput);
+    const promptResult = await dynamicPromptClient.getPromptFromMessage(userInput, selectedModel);
     
     if (promptResult) {
       console.error(`[LOG][CHAT] [PROMPT_SELECTION] Detected prompt: ${promptResult.promptName}`);
