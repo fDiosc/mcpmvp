@@ -28,7 +28,7 @@
     "@timbreeding/jira-mcp-server": "latest",
     "dotenv": "^16.5.0",
     "express": "^5.1.0",
-    "node-fetch": "^2.6.7",
+    "node-fetch": "^2.7.0",
     "openai": "^4.97.0",
     "prisma": "^6.7.0",
     "puppeteer": "^24.8.0",
