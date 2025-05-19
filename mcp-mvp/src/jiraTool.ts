@@ -2,44 +2,40 @@ import { z } from 'zod';
 import fetch, { RequestInit, Response } from 'node-fetch';
 import { UserJiraCredentials, RequestContext } from './types.js';
 
-// New function to get Jira credentials dynamically or from environment
-async function getJiraCredentials(requestContext?: RequestContext): Promise<UserJiraCredentials> {
-  const USE_ENV_FOR_JIRA_CREDENTIALS = process.env.USE_ENV_FOR_JIRA_CREDENTIALS === 'true';
-
-  if (!USE_ENV_FOR_JIRA_CREDENTIALS && requestContext?.userJiraCredentials) {
-    if (
-      requestContext.userJiraCredentials.baseUrl &&
-      requestContext.userJiraCredentials.username &&
-      requestContext.userJiraCredentials.apiToken
-    ) {
-      console.log(`[JiraClient] Using dynamic user credentials for user: ${requestContext.productLabUserId || 'Unknown'}`);
-      return requestContext.userJiraCredentials;
-    } else {
-      console.error('[JiraClient] Attempted to use dynamic credentials, but they are incomplete.', requestContext.userJiraCredentials);
-      throw new Error('Incomplete dynamic Jira credentials provided.');
-    }
-  }
-
-  if (USE_ENV_FOR_JIRA_CREDENTIALS) {
-    const ENV_JIRA_BASE_URL = process.env.JIRA_BASE_URL;
-    const ENV_JIRA_USERNAME = process.env.JIRA_USERNAME;
-    const ENV_JIRA_API_TOKEN = process.env.JIRA_API_TOKEN;
-    if (ENV_JIRA_BASE_URL && ENV_JIRA_USERNAME && ENV_JIRA_API_TOKEN) {
-      console.log('[JiraClient] Using environment credentials for Jira.');
-      return {
-        baseUrl: ENV_JIRA_BASE_URL,
-        username: ENV_JIRA_USERNAME,
-        apiToken: ENV_JIRA_API_TOKEN,
-      };
-    } else {
-      console.error('[JiraClient] USE_ENV_FOR_JIRA_CREDENTIALS is true, but environment variables are incomplete.');
-      throw new Error('Jira environment variables (JIRA_BASE_URL, JIRA_USERNAME, JIRA_API_TOKEN) are not fully set.');
-    }
+// Função para obter credenciais Jira
+const getJiraCredentials = (args: any): UserJiraCredentials => {
+  const useEnvCredentials = process.env.USE_ENV_FOR_JIRA_CREDENTIALS === 'true';
+  
+  // Option 1: Use credentials passed in the tool arguments (from session)
+  if (args._jiraCredentials && 
+      args._jiraCredentials.baseUrl && 
+      args._jiraCredentials.username && 
+      args._jiraCredentials.apiToken) {
+    console.log('[JIRA-TOOL] Using credentials from tool arguments');
+    return {
+      baseUrl: args._jiraCredentials.baseUrl,
+      username: args._jiraCredentials.username,
+      apiToken: args._jiraCredentials.apiToken
+    };
   }
   
-  console.error('[JiraClient] Critical credential configuration error. Unable to determine Jira credentials. USE_ENV_FOR_JIRA_CREDENTIALS is false and no dynamic credentials were provided or were incomplete.');
-  throw new Error('Jira credentials configuration error. Cannot proceed with Jira API call.');
-}
+  // Option 2: Use environment variables if configured to do so
+  if (useEnvCredentials) {
+    console.log('[JIRA-TOOL] Using credentials from environment variables');
+    const baseUrl = process.env.JIRA_BASE_URL;
+    const username = process.env.JIRA_USERNAME;
+    const apiToken = process.env.JIRA_API_TOKEN;
+    
+    if (!baseUrl || !username || !apiToken) {
+      throw new Error('Jira credentials not found in environment variables. Please set JIRA_BASE_URL, JIRA_USERNAME and JIRA_API_TOKEN.');
+    }
+    
+    return { baseUrl, username, apiToken };
+  }
+  
+  // No credentials available
+  throw new Error('Jira credentials not available. Please set credentials using the Jira configuration UI or enable USE_ENV_FOR_JIRA_CREDENTIALS');
+};
 
 // Common utility for API calls - Modified
 async function callJiraApi(
@@ -49,9 +45,9 @@ async function callJiraApi(
     payload?: unknown;
     customHeaders?: Record<string, string>;
   } = {},
-  requestContext?: RequestContext // Added requestContext
+  extra?: any // Added extra parameter
 ): Promise<any> {
-  const creds = await getJiraCredentials(requestContext);
+  const creds = await getJiraCredentials(extra);
   const { baseUrl, username, apiToken } = creds;
 
   const url = `${baseUrl.replace(/\/$/, '')}${endpoint}`; // Avoid double slashes
@@ -125,7 +121,9 @@ export const getJiraIssueTool = {
 };
 
 // Executor da tool (adaptado do Jira MCP) - Modified
-export async function getJiraIssueExecutor(args: any, requestContext: RequestContext) { // Modified signature
+export async function getJiraIssueExecutor(args: any) {
+  console.error('[DEBUG][JIRA_EXECUTOR] getJiraIssueExecutor context:', args);
+  const creds = await getJiraCredentials(args);
   const parsed = getJiraIssueZodSchema.safeParse(args);
   if (!parsed.success) {
     return {
@@ -142,7 +140,7 @@ export async function getJiraIssueExecutor(args: any, requestContext: RequestCon
 
   try {
     // Refactored to use callJiraApi
-    const data = await callJiraApi(endpoint, 'GET', {}, requestContext); 
+    const data = await callJiraApi(endpoint, 'GET', {}, creds); 
     return {
       content: [{
         type: "text" as const,
@@ -211,7 +209,9 @@ export const getDetailedJiraIssueTool = {
 };
 
 // Executor - Modified
-export async function getDetailedJiraIssueExecutor(args: any, requestContext: RequestContext) { // Modified signature
+export async function getDetailedJiraIssueExecutor(args: any) {
+  console.error('[DEBUG][JIRA_EXECUTOR] getDetailedJiraIssueExecutor context:', args);
+  const creds = await getJiraCredentials(args);
   const parsed = getDetailedJiraIssueZodSchema.safeParse(args);
   if (!parsed.success) {
     return {
@@ -232,7 +232,7 @@ export async function getDetailedJiraIssueExecutor(args: any, requestContext: Re
   const endpoint = `/rest/api/3/issue/${issueKey}${queryParams.toString() ? '?' + queryParams.toString() : ''}`;
   
   try {
-    const data = await callJiraApi(endpoint, 'GET', {}, requestContext); // Using callJiraApi
+    const data = await callJiraApi(endpoint, 'GET', {}, creds); // Using callJiraApi
     
     // Basic formatting, can be expanded
     const formattedData = {
@@ -321,7 +321,9 @@ export const getJiraIssueCommentsTool = {
 };
 
 // Executor
-export async function getJiraIssueCommentsExecutor(args: any, requestContext: RequestContext) {
+export async function getJiraIssueCommentsExecutor(args: any) {
+  console.error('[DEBUG][JIRA_EXECUTOR] getJiraIssueCommentsExecutor context:', args);
+  const creds = await getJiraCredentials(args);
   try {
     const parsed = getJiraIssueCommentsZodSchema.safeParse(args);
     if (!parsed.success) {
@@ -345,7 +347,7 @@ export async function getJiraIssueCommentsExecutor(args: any, requestContext: Re
     const endpoint = `/rest/api/3/issue/${issueKey}/comment${queryParams.toString() ? '?' + queryParams.toString() : ''}`;
     
     try {
-      const data = await callJiraApi(endpoint, 'GET', {}, requestContext);
+      const data = await callJiraApi(endpoint, 'GET', {}, creds);
       
       // Format the comments for better readability
       const formattedComments = data.comments.map((comment: any) => ({
@@ -430,7 +432,8 @@ export const getJiraIssueTransitionsTool = {
 };
 
 // Executor
-export async function getJiraIssueTransitionsExecutor(args: any, requestContext: RequestContext) {
+export async function getJiraIssueTransitionsExecutor(args: any) {
+  console.error('[DEBUG][JIRA_EXECUTOR] getJiraIssueTransitionsExecutor context:', args);
   try {
     const parsed = getJiraIssueTransitionsZodSchema.safeParse(args);
     if (!parsed.success) {
@@ -452,7 +455,7 @@ export async function getJiraIssueTransitionsExecutor(args: any, requestContext:
     const endpoint = `/rest/api/3/issue/${issueKey}/transitions${queryParams.toString() ? '?' + queryParams.toString() : ''}`;
     
     try {
-      const data = await callJiraApi(endpoint, 'GET', {}, requestContext);
+      const data = await callJiraApi(endpoint, 'GET', {}, args);
       
       // Format the transitions for better readability
       const formattedTransitions = data.transitions.map((transition: any) => ({
@@ -565,7 +568,8 @@ export const searchJiraIssuesTool = {
 };
 
 // Executor
-export async function searchJiraIssuesExecutor(args: any, requestContext: RequestContext) {
+export async function searchJiraIssuesExecutor(args: any) {
+  console.error('[DEBUG][JIRA_EXECUTOR] searchJiraIssuesExecutor context:', args);
   try {
     const parsed = searchJiraIssuesZodSchema.safeParse(args);
     if (!parsed.success) {
@@ -591,7 +595,7 @@ export async function searchJiraIssuesExecutor(args: any, requestContext: Reques
     const endpoint = `/rest/api/3/search?${queryParams.toString()}`;
     
     try {
-      const data = await callJiraApi(endpoint, 'GET', {}, requestContext);
+      const data = await callJiraApi(endpoint, 'GET', {}, args);
       
       // Format the search results for better readability
       const formattedIssues = data.issues.map((issue: any) => ({
@@ -673,7 +677,8 @@ export const getJiraIssueWatchersTool = {
 };
 
 // Executor
-export async function getJiraIssueWatchersExecutor(args: any, requestContext: RequestContext) {
+export async function getJiraIssueWatchersExecutor(args: any) {
+  console.error('[DEBUG][JIRA_EXECUTOR] getJiraIssueWatchersExecutor context:', args);
   try {
     const parsed = getJiraIssueWatchersZodSchema.safeParse(args);
     if (!parsed.success) {
@@ -691,7 +696,7 @@ export async function getJiraIssueWatchersExecutor(args: any, requestContext: Re
     const endpoint = `/rest/api/3/issue/${issueKey}/watchers`;
     
     try {
-      const data = await callJiraApi(endpoint, 'GET', {}, requestContext);
+      const data = await callJiraApi(endpoint, 'GET', {}, args);
       
       // Format the watchers for better readability
       const formattedWatchers = data.watchers.map((watcher: any) => ({
@@ -766,7 +771,8 @@ export const getJiraIssueAttachmentsTool = {
 };
 
 // Executor
-export async function getJiraIssueAttachmentsExecutor(args: any, requestContext: RequestContext) {
+export async function getJiraIssueAttachmentsExecutor(args: any) {
+  console.error('[DEBUG][JIRA_EXECUTOR] getJiraIssueAttachmentsExecutor context:', args);
   try {
     const parsed = getJiraIssueAttachmentsZodSchema.safeParse(args);
     if (!parsed.success) {
@@ -785,7 +791,7 @@ export async function getJiraIssueAttachmentsExecutor(args: any, requestContext:
     const endpoint = `/rest/api/3/issue/${issueKey}?fields=attachment`;
     
     try {
-      const data = await callJiraApi(endpoint, 'GET', {}, requestContext);
+      const data = await callJiraApi(endpoint, 'GET', {}, args);
       
       // Make sure attachments exist in the response
       if (!data.fields || !data.fields.attachment) {
@@ -875,7 +881,8 @@ export const getJiraIssueSprintsTool = {
 };
 
 // Executor
-export async function getJiraIssueSprintsExecutor(args: any, requestContext: RequestContext) {
+export async function getJiraIssueSprintsExecutor(args: any) {
+  console.error('[DEBUG][JIRA_EXECUTOR] getJiraIssueSprintsExecutor context:', args);
   try {
     const parsed = getJiraIssueSprintsZodSchema.safeParse(args);
     if (!parsed.success) {
@@ -894,7 +901,7 @@ export async function getJiraIssueSprintsExecutor(args: any, requestContext: Req
     const endpoint = `/rest/agile/1.0/issue/${issueKey}?fields=sprint,closedSprints,project`;
     
     try {
-      const data = await callJiraApi(endpoint, 'GET', {}, requestContext);
+      const data = await callJiraApi(endpoint, 'GET', {}, args);
       
       // Extract sprint information from the response
       const currentSprint = data.fields?.sprint ? {
@@ -977,7 +984,8 @@ export const addJiraCommentTool = {
   description: "Adds a comment to a Jira issue.",
 };
 
-export async function addJiraCommentExecutor(args: any, requestContext: RequestContext) {
+export async function addJiraCommentExecutor(args: any) {
+  console.error('[DEBUG][JIRA_EXECUTOR] addJiraCommentExecutor context:', args);
   const parsed = addJiraCommentZodSchema.safeParse(args);
   if (!parsed.success) {
     return { content: [{ type: "text" as const, text: 'Invalid arguments: ' + JSON.stringify(parsed.error.issues) }], isError: true };
@@ -987,7 +995,7 @@ export async function addJiraCommentExecutor(args: any, requestContext: RequestC
   const payload = { body: { type: "doc", version: 1, content: [{ type: "paragraph", content: [{ type: "text", text: body }] }] } }; // Jira Cloud comment format
 
   try {
-    const data = await callJiraApi(endpoint, 'POST', { payload }, requestContext);
+    const data = await callJiraApi(endpoint, 'POST', { payload }, args);
     return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
   } catch (err: any) {
     return { content: [{ type: "text" as const, text: `Error adding comment to ${issueKey}: ${err.message}` }], isError: true };
