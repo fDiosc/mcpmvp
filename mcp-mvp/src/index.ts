@@ -10,7 +10,7 @@
  */
 
 import './logger.js'; // This should be the very first import to ensure console is patched early.
-import express, { Request, Response, Express } from "express";
+import express, { Request, Response } from "express";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { z } from "zod";
@@ -52,9 +52,9 @@ import { OpenAI } from "openai";
 import Anthropic from "@anthropic-ai/sdk";
 import { CustomAnthropicMessage, CustomContentBlock } from './anthropicClient.js';
 import { v4 as uuidv4 } from 'uuid';
-import { SessionManager } from './session-manager.js';
-import { WorkerPool } from './worker-pool.js';
-import { sessionCredentialsMap } from './user-session.js';
+import { sessionEnvManager } from './session-env-manager.js';
+import { runWithSession } from './session-context.js';
+import { saveSessionSecret } from './session-secrets.js';
 dotenv.config();
 
 // Instância do OpenAI para chamar a API
@@ -151,11 +151,120 @@ registerToolSelectionPrompt(server);
 registerNewsletterPrompt(server);
 registerReleaseNotePrompt(server);
 
-// Inicializar componentes principais
-const sessionManager = new SessionManager();
-const workerPool = new WorkerPool(5); // 5 workers concorrentes
+// Module-scoped variable to hold context for the current /chat request (USE WITH EXTREME CAUTION - SEE COMMENTS)
+let currentChatRequestContext: RequestContext | null = null;
 
-const app: Express = express();
+// Helper function to safely extract RequestContext
+// TRYING THE MODULE-SCOPED HACK HERE
+function getRequestContextFromExtra(extra: any): RequestContext {
+  if (currentChatRequestContext) {
+    // console.warn('[getRequestContextFromExtra] Using currentChatRequestContext hack for user:', currentChatRequestContext.productLabUserId || 'N/A');
+    return currentChatRequestContext;
+  }
+  // Fallback if the hack isn't set (e.g., for tools called in other ways, or if 'extra' eventually contains it)
+  if (extra && typeof extra === 'object' && 'requestContext' in extra) {
+    // console.warn('[getRequestContextFromExtra] Found requestContext in extra parameter.');
+    return extra.requestContext as RequestContext;
+  }
+  // console.warn('[getRequestContextFromExtra] RequestContext not found. Jira tools might not use user-specific credentials if env vars are off.');
+  return {}; 
+}
+
+// MODIFIED Jira tool registration for get_jira_issue
+server.tool(
+  getJiraIssueTool.name, 
+  {
+    issueKey: z.string().describe("The Jira issue key or ID (e.g., 'PROJ-123')")
+  },
+  async (args) => getJiraIssueExecutor(args)
+);
+
+// 1. Get Detailed Jira Issue
+server.tool(
+  getDetailedJiraIssueTool.name,
+  {
+    issueKey: z.string().describe("The key of the Jira issue (e.g., 'PROJ-123')"),
+    fields: z.string().optional().describe("Comma-separated list of fields to return"),
+    expand: z.string().optional().describe("Comma-separated list of entities to expand")
+  },
+  async (args) => getDetailedJiraIssueExecutor(args)
+);
+
+// 2. Get Jira Issue Comments
+server.tool(
+  getJiraIssueCommentsTool.name,
+  {
+    issueKey: z.string().describe("The key of the Jira issue (e.g., 'PROJ-123')"),
+    startAt: z.number().optional().describe("The index of the first item to return"),
+    maxResults: z.number().optional().describe("The maximum number of items to return"),
+    orderBy: z.string().optional().describe("Order of returned comments (e.g., 'created', '-created')")
+  },
+  async (args) => getJiraIssueCommentsExecutor(args)
+);
+
+// 3. Get Jira Issue Transitions
+server.tool(
+  getJiraIssueTransitionsTool.name,
+  {
+    issueKey: z.string().describe("The key of the Jira issue (e.g., 'PROJ-123')"),
+    expand: z.string().optional().describe("Expand operations for the returned transitions")
+  },
+  async (args) => getJiraIssueTransitionsExecutor(args)
+);
+
+// 4. Search Jira Issues with JQL
+server.tool(
+  searchJiraIssuesTool.name,
+  {
+    jql: z.string().describe("JQL search query (e.g., \"assignee = currentUser() AND status = 'In Progress'\")"),
+    startAt: z.number().optional().describe("The index of the first item to return"),
+    maxResults: z.number().optional().describe("The maximum number of items to return"),
+    fields: z.string().optional().describe("Comma-separated list of fields to return"),
+    expand: z.string().optional().describe("Comma-separated list of entities to expand")
+  },
+  async (args) => searchJiraIssuesExecutor(args)
+);
+
+// 5. Get Jira Issue Watchers
+server.tool(
+  getJiraIssueWatchersTool.name,
+  {
+    issueKey: z.string().describe("The key of the Jira issue (e.g., 'PROJ-123')")
+  },
+  async (args) => getJiraIssueWatchersExecutor(args)
+);
+
+// 6. Get Jira Issue Attachments
+server.tool(
+  getJiraIssueAttachmentsTool.name,
+  {
+    issueKey: z.string().describe("The key of the Jira issue (e.g., 'PROJ-123')")
+  },
+  async (args) => getJiraIssueAttachmentsExecutor(args)
+);
+
+// 7. Get Jira Issue Sprints
+server.tool(
+  getJiraIssueSprintsTool.name,
+  {
+    issueKey: z.string().describe("The key of the Jira issue (e.g., 'PROJ-123')")
+  },
+  async (args) => getJiraIssueSprintsExecutor(args)
+);
+
+// Example for addJiraCommentTool
+if (addJiraCommentTool && addJiraCommentExecutor) {
+  server.tool(
+    addJiraCommentTool.name,
+    {
+      issueKey: z.string().describe("The key of the issue to comment on."),
+      body: z.string().describe("The comment text.")
+    },
+    async (args) => addJiraCommentExecutor(args)
+  );
+}
+
+const app = express();
 
 // Armazena sessões SSE ativas
 const sseSessions = new Map();
@@ -317,38 +426,579 @@ async function callClaudeHaiku(messages: any[], tools: any[], sessionIdentifier:
   }
 }
 
-app.post('/chat', async (req, res) => {
-  try {
-    const userId = req.body.userId || req.body.productLabUserId || 'anonymous';
-    const productLabUserId = req.body.productLabUserId;
-    if (!userId) {
-      return res.status(400).json({
-        error: "Missing_User_ID",
-        message: "User ID is required for chat requests"
+app.post('/chat', async (req: Request, res: Response) => {
+  const USE_ENV_FOR_JIRA_CREDENTIALS = process.env.USE_ENV_FOR_JIRA_CREDENTIALS === 'true';
+  const userId = req.body.userId;
+  const productLabUserId = req.body.productLabUserId;
+  const sessionId = req.body.sessionId;
+  const message = req.body.message;
+  let activeRequestContext: RequestContext = {};
+
+  if (!USE_ENV_FOR_JIRA_CREDENTIALS) {
+    const userJiraCreds = req.body.jiraAuth as UserJiraCredentials | undefined;
+    if (!userJiraCreds || !userJiraCreds.baseUrl || !userJiraCreds.username || !userJiraCreds.apiToken) {
+      res.status(400).json({
+        error: "Jira_Credentials_Required",
+        message: "User Jira credentials are required. Please ensure jiraAuth: { baseUrl, username, apiToken } is sent."
       });
+      return;
     }
-    // Obter ou criar sessão do usuário
-    const userSession = sessionManager.getOrCreateSession(userId, productLabUserId);
-    // Atualizar credenciais Jira, se fornecidas
-    if (req.body.jiraAuth) {
-      userSession.setJiraCredentials(req.body.jiraAuth);
+    activeRequestContext.userJiraCredentials = userJiraCreds;
+    if (productLabUserId) {
+      activeRequestContext.productLabUserId = productLabUserId;
     }
-    // Delegar processamento para um worker
-    const result = await workerPool.processRequest(
-      req.body.message,
-      userSession,
-      req.body.model || 'anthropic'
-    );
-    // Retornar resposta
-    res.json({
-      sessionId: userSession.conversationId,
-      ...result
-    });
-      } catch (err) {
-    console.error('[SERVER] Unhandled error in /chat:', err);
-    const message = err instanceof Error ? err.message : String(err);
-    res.status(500).json({ error: message });
   }
+
+  // Obter ou criar sessão
+  const session = sessionEnvManager.getOrCreateSession(userId, productLabUserId);
+  if (activeRequestContext.userJiraCredentials) {
+    session.setJiraCredentials(activeRequestContext.userJiraCredentials);
+    saveSessionSecret(session.sessionId, activeRequestContext.userJiraCredentials);
+  }
+  if (activeRequestContext.productLabUserId) {
+    session.productLabUserId = activeRequestContext.productLabUserId;
+  }
+
+  await runWithSession(session, async () => {
+    console.error('[DEBUG][SESSION] Contexto de sessão no início do /chat:', JSON.stringify(session.getRequestContext(), null, 2));
+    try {
+      const selectedModel = req.body.model || 'openai';
+      const userInput = req.body.message;
+      console.error('[LOG][CHAT] Incoming request:', { model: selectedModel, message: userInput, productLabUserId: activeRequestContext.productLabUserId });
+      
+      if (!mcpClient) {
+        const sseUrl = new URL('http://localhost:3333/mcp/sse');
+        const transport = new SSEClientTransport(sseUrl);
+        mcpClient = new Client({ name: 'openai-client', version: '0.1.0' });
+        await mcpClient.connect(transport);
+        console.error('[LOG][CHAT] MCP client connected');
+      }
+      
+      let dynamicToolClient = new DynamicToolClient(mcpClient);
+      let dynamicPromptClient = new DynamicPromptClient(mcpClient);
+      let mcpTools;
+      let toolSelectionMethod = '';
+      const enableContextFiltering = process.env.ENABLE_CONTEXT_FILTERING === 'true';
+
+      let promptMessages = null;
+      let systemPrompt = null;
+
+      console.error('[LOG][CHAT] Checking for prompt context...');
+      const promptResult = await dynamicPromptClient.getPromptFromMessage(userInput, selectedModel);
+      
+      if (promptResult) {
+        console.error(`[LOG][CHAT] [PROMPT_SELECTION] Detected prompt: ${promptResult.promptName}`);
+        systemPrompt = promptResult.system;
+        promptMessages = [
+          ...(promptResult.promptContent || []),
+          { 
+            role: 'user',
+            content: [{
+              type: 'text',
+              text: userInput
+            }]
+          }
+        ];
+        console.error('[LOG][DYNAMIC_PROMPT] Formatted messages:', JSON.stringify(promptMessages));
+      } else {
+        console.error('[LOG][CHAT] No specific prompt context detected, proceeding with normal flow');
+      }
+
+      if (enableContextFiltering) {
+        console.error('[LOG][CHAT] Analyzing user input for context detection (keyword mapping)...');
+        const contexts = extractContextFromMessage(userInput);
+        if (contexts.length > 0) {
+          toolSelectionMethod = 'keyword';
+          console.error(`[LOG][CHAT] [TOOL_SELECTION] Method: keyword | Context detected: ${contexts.join(', ')}`);
+          mcpTools = await dynamicToolClient.getToolsFromMessage(userInput);
+          console.error(`[LOG][CHAT] Loaded ${mcpTools.tools.length} tools for detected context`);
+        } else {
+          toolSelectionMethod = 'contextual';
+          console.error(`[LOG][CHAT] [TOOL_SELECTION] Method: contextual | No context detected, using LLM-assisted tool selection with model: ${selectedModel}`);
+          const allTools = await dynamicToolClient.getTools({});
+          const toolsText = allTools.tools.map((t: any) => `- ${t.name}: ${t.description}`).join('\n');
+          const promptText = `\nUsuário enviou a seguinte mensagem:\n"${userInput}"\n\nLista de ferramentas disponíveis:\n${toolsText}\n\nQuais ferramentas são relevantes para atender ao pedido do usuário?\nResponda apenas com uma lista de nomes de ferramentas, separados por vírgula.`;
+          let llmResponse = '';
+          try {
+            if (selectedModel === 'openai') {
+              if (!assistant) {
+                assistant = await createDynamicAssistant(mcpClient);
+                console.error('[LOG][CHAT] OpenAI assistant created with MCP tools as functions');
+              }
+              if (!thread) {
+                thread = await createThread();
+                console.error('[LOG][CHAT] OpenAI thread created');
+              }
+              llmResponse = await sendMessage(mcpClient, thread.id, assistant.id, promptText);
+              console.error('[LOG][CHAT] [TOOL_SELECTION] LLM (OpenAI) response for tool selection:', llmResponse);
+            } else if (selectedModel === 'anthropic') {
+              const messages = [{ role: 'user' as const, content: [{ type: 'text' as const, text: promptText }] }];
+              const response = await callClaudeDirectAPI(messages, [], undefined);
+              llmResponse = response.content && Array.isArray(response.content) && response.content[0]?.type === 'text' ? response.content[0].text : '';
+              console.error('[LOG][CHAT] [TOOL_SELECTION] LLM (Claude API Direct) response for tool selection:', llmResponse);
+            } else if (selectedModel === 'bedrock') {
+              const messages = [{ role: 'user', content: promptText }];
+              const response = await callClaudeHaiku(messages, [], '');
+              llmResponse = response?.content?.[0]?.text || '';
+              console.error('[LOG][CHAT] [TOOL_SELECTION] LLM (Claude Bedrock) response for tool selection:', llmResponse);
+            } else {
+              throw new Error('Modelo não suportado para seleção contextual');
+            }
+          } catch (err) {
+            console.error('[LOG][CHAT] [TOOL_SELECTION] Error calling LLM for tool selection:', err);
+          }
+          let suggestedToolNames: string[] = [];
+          if (llmResponse && typeof llmResponse === 'string') {
+            suggestedToolNames = llmResponse.split(',').map(s => s.trim()).filter(Boolean);
+          }
+          const relevantTools = allTools.tools.filter((t: any) => suggestedToolNames.includes(t.name));
+          if (relevantTools.length > 0) {
+            mcpTools = {
+              tools: relevantTools,
+              metadata: {
+                timestamp: new Date().toISOString(),
+                requestId: crypto.randomUUID().toString(),
+                filtered: true,
+                originalCount: allTools.tools.length,
+                returnedCount: relevantTools.length,
+                reductionPercent: Math.round(((allTools.tools.length - relevantTools.length) / allTools.tools.length) * 100),
+                reason: 'contextual_llm_selection'
+              }
+            };
+            console.error(`[LOG][CHAT] [TOOL_SELECTION] LLM selected ${relevantTools.length} tools: ${relevantTools.map((t: any) => t.name).join(', ')}`);
+          } else {
+            toolSelectionMethod = 'contextual_none';
+            mcpTools = {
+              tools: [],
+              metadata: {
+                timestamp: new Date().toISOString(),
+                requestId: crypto.randomUUID().toString(),
+                filtered: true,
+                originalCount: allTools.tools.length,
+                returnedCount: 0,
+                reductionPercent: 100,
+                reason: 'contextual_llm_none_suggested'
+              }
+            };
+            console.error('[LOG][CHAT] [TOOL_SELECTION] LLM did not suggest any tools, returning empty tool array');
+          }
+        }
+      } else {
+        toolSelectionMethod = 'all/unfiltered';
+        console.error('[LOG][CHAT] [TOOL_SELECTION] Method: all/unfiltered | Context filtering disabled, loading all tools');
+        mcpTools = await dynamicToolClient.getTools({});
+        console.error(`[LOG][CHAT] Loaded ${mcpTools.tools.length} tools (unfiltered)`);
+      }
+      
+      const toolsClaude = mcpTools.tools.map((tool: any) => ({
+        name: tool.name,
+        description: tool.description || `MCP tool: ${tool.name}`,
+        input_schema: tool.inputSchema
+      }));
+      
+      if (mcpTools.tools.length > 0) {
+        toolMetrics.trackToolTokens(mcpTools.tools, 'filtered');
+      }
+      
+      if (selectedModel === 'openai') {
+        if (!assistant) {
+          assistant = await createDynamicAssistant(mcpClient);
+          console.error('[LOG][CHAT] OpenAI assistant created with MCP tools as functions');
+        }
+        if (!thread) {
+          thread = await createThread();
+          console.error('[LOG][CHAT] OpenAI thread created');
+        }
+        
+        try {
+          let response;
+          if (promptMessages) {
+            console.error('[LOG][CHAT] Using detected prompt for OpenAI...');
+            
+            for (const promptMessage of promptMessages) {
+              const role = promptMessage.role || 'user';
+              let content = '';
+              
+              if (typeof promptMessage.content === 'string') {
+                content = promptMessage.content;
+              } else if (promptMessage.content.type === 'text') {
+                content = promptMessage.content.text;
+              } else {
+                content = JSON.stringify(promptMessage.content);
+              }
+              
+              await openai.beta.threads.messages.create(thread.id, {
+                role: role as any,
+                content: content
+              });
+            }
+            
+            const run = await openai.beta.threads.runs.create(thread.id, {
+              assistant_id: assistant.id
+            });
+            
+            let completed = false;
+            let runResult;
+            
+            while (!completed) {
+              await new Promise(resolve => setTimeout(resolve, 1000));
+              runResult = await openai.beta.threads.runs.retrieve(thread.id, run.id);
+              console.log('[DEBUG][OPENAI][RUN STATUS]', runResult.status, runResult);
+
+              if (runResult.status === 'requires_action' && runResult.required_action && runResult.required_action.submit_tool_outputs) {
+                const toolCalls = runResult.required_action.submit_tool_outputs.tool_calls;
+                const tool_outputs = [];
+                for (const call of toolCalls) {
+                  const toolName = call.function.name;
+                  const args = JSON.parse(call.function.arguments);
+                  let result;
+                  if (toolName.startsWith('getJira') || toolName === 'getDetailedJiraIssue') {
+                    result = await mcpClient.callTool({ name: toolName, arguments: { ...args, sessionId: session.sessionId } });
+                    console.error('[DEBUG][TOOL_CALL][OPENAI] Propagando sessionId para tool Jira:', toolName, session.sessionId);
+                  } else {
+                    result = await mcpClient.callTool({ name: toolName, arguments: args });
+                  }
+                  console.log('[DEBUG][OPENAI][TOOL OUTPUTS][CALL]', toolName, args, 'with context for (via hack):', activeRequestContext?.productLabUserId);
+                  
+                  let output = '';
+                  if (result?.content && Array.isArray(result.content) && result.content[0]?.text) {
+                    output = result.content[0].text;
+                  } else {
+                    output = JSON.stringify(result);
+                  }
+                  tool_outputs.push({ tool_call_id: call.id, output });
+                }
+                console.log('[DEBUG][OPENAI][TOOL OUTPUTS][SUBMIT]', tool_outputs);
+                const submitResult = await openai.beta.threads.runs.submitToolOutputs(thread.id, run.id, { tool_outputs });
+                console.log('[DEBUG][OPENAI][TOOL OUTPUTS][RESPONSE]', submitResult);
+              }
+
+              if (runResult.status === 'completed' || 
+                  runResult.status === 'failed' || 
+                  runResult.status === 'cancelled') {
+                completed = true;
+              }
+            }
+            
+            const messages = await openai.beta.threads.messages.list(thread.id, {
+              order: 'desc',
+              limit: 1
+            });
+            
+            if (messages.data.length > 0) {
+              const latestMessage = messages.data[0];
+              if (latestMessage.content && latestMessage.content.length > 0) {
+                const content = latestMessage.content[0];
+                if (content.type === 'text') {
+                  response = content.text.value;
+                } else {
+                  response = JSON.stringify(content);
+                }
+              }
+            }
+          } else {
+            response = await sendMessage(mcpClient, thread.id, assistant.id, userInput);
+          }
+          
+          console.error('[LOG][CHAT] OpenAI response received');
+          res.json({ response });
+          return;
+        } catch (err) {
+          console.error('[OpenAI] Error in sendMessage:', err);
+          res.status(500).json({ error: 'Erro ao processar mensagem com OpenAI.' });
+          return;
+        }
+      } else if (selectedModel === 'bedrock') {
+        let messages = Array.isArray(req.body.history) ? req.body.history.slice() : [];
+        
+        if (promptMessages) {
+          console.error('[LOG][CHAT] Using detected prompt for Bedrock Claude...');
+          
+          messages = promptMessages.map(pm => {
+            if (typeof pm.content === 'string') {
+              return { role: pm.role, content: pm.content };
+            } else if (pm.content.type === 'text') {
+              return { role: pm.role, content: pm.content.text };
+            } else {
+              return { role: pm.role, content: JSON.stringify(pm.content) };
+            }
+          });
+        } else if (messages.length === 0) {
+          messages = [{ role: "user", content: userInput }];
+        } else if (messages.length > 0 && messages[messages.length - 1].role !== 'user') {
+          messages.push({ role: "user", content: userInput });
+        }
+        
+        let recursion = 0;
+        const MAX_RECURSION = 5;
+        let finished = false;
+        let finalTexts: string[] = [];
+        
+        while (!finished && recursion < MAX_RECURSION) {
+          let response;
+          try {
+            if (messages.length > 0 && messages[messages.length - 1].role === 'assistant') {
+              break;
+            }
+            console.error('[LOG][CHAT] Calling Claude with:', { messages, toolsClaude });
+            response = await callClaudeHaiku(messages, toolsClaude, '');
+            console.error('[LOG][CHAT] Claude response:', response);
+          } catch (err) {
+            console.error('[Bedrock Claude] Error on Claude call:', err);
+            res.status(500).json({ error: 'Erro ao chamar Claude (Bedrock).' });
+            return;
+          }
+          
+          finished = true;
+          if (response.type === "message" && Array.isArray(response.content)) {
+            for (const block of response.content) {
+              if (block.type === "text") {
+                finalTexts.push(block.text);
+                messages.push({ role: "assistant", content: block.text });
+              } else if (block.type === "tool_use") {
+                console.error('[LOG][CHAT] Tool use detected:', block, 'with context for (via hack):', activeRequestContext?.productLabUserId);
+                try {
+                  const toolName = block.name;
+                  const args = JSON.parse(block.input);
+                  let executionResult;
+                  if (toolName.startsWith('getJira') || toolName === 'getDetailedJiraIssue') {
+                    executionResult = await mcpClient.callTool({ name: toolName, arguments: { ...args, sessionId: session.sessionId } });
+                    console.error('[DEBUG][TOOL_CALL][ANTHROPIC] Propagando sessionId para tool Jira:', toolName, session.sessionId);
+                  } else {
+                    executionResult = await mcpClient.callTool({ name: toolName, arguments: args });
+                  }
+                  console.error('[LOG][CHAT] MCP tool result:', executionResult);
+                  let toolResultContent = [];
+                  if (executionResult && executionResult.content && Array.isArray(executionResult.content) && executionResult.content.length > 0) {
+                    toolResultContent = executionResult.content.map((c: any) => ({ type: 'text', text: c.text || JSON.stringify(c) }));
+                  } else if (typeof executionResult.content === 'string') {
+                    toolResultContent = [{ type: 'text', text: executionResult.content }];
+                  } else {
+                    toolResultContent = [{ type: 'text', text: JSON.stringify(executionResult) }];
+                  }
+                  let toolResultPayload;
+                  if (executionResult && typeof executionResult === 'object') {
+                    toolResultPayload = JSON.stringify(executionResult);
+                  } else if (toolResultContent.length === 1 && toolResultContent[0].text) {
+                    toolResultPayload = toolResultContent[0].text;
+                  } else {
+                    toolResultPayload = JSON.stringify(toolResultContent);
+                  }
+                  messages.push({
+                    role: 'user',
+                    content: toolResultPayload
+                  });
+                  finalTexts.push(toolResultContent.map((c: any) => c.text).join('\n'));
+                  finished = false;
+                } catch (err) {
+                  console.error('[Bedrock Claude] Error during tool call (recursion ' + recursion + '):', err);
+                  res.status(500).json({ error: 'Erro ao executar ferramenta MCP para Claude (Bedrock).' });
+                  return;
+                }
+              }
+            }
+            finished = !response.content.some((c: any) => c.type === "tool_use");
+          } else {
+            finished = true;
+          }
+          if (messages.length > 0 && messages[messages.length - 1].role === 'assistant') {
+            break;
+          }
+          recursion++;
+        }
+        const finalText = finalTexts.join('\n');
+        console.error('[LOG][CHAT] Final response to frontend:', finalText);
+        res.json({ response: finalText });
+        return;
+      } else if (selectedModel === 'anthropic') {
+        console.error('[LOG][CHAT] Using direct Anthropic API integration');
+        
+        const userInputText = typeof req.body.message === 'string' ? req.body.message : JSON.stringify(req.body.message);
+
+        let currentTurnMessages: CustomAnthropicMessage[] = [];
+        const providedHistory = req.body.history || [];
+
+        if (Array.isArray(providedHistory) && providedHistory.length > 0) {
+          console.error('[LOG][ANTHROPIC] Initializing with history provided by client.');
+          currentTurnMessages = JSON.parse(JSON.stringify(providedHistory));
+        }
+
+        currentTurnMessages.push({ 
+          role: 'user' as const, 
+          content: [{ type: 'text' as const, text: userInputText }] 
+        });
+        
+        const clientId = req.body.sessionId || `jira-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+        console.error(`[LOG][ANTHROPIC] Usando ID de sessão para cache: ${clientId}`);
+        
+        const anthropicTools = convertMcpToolsToAnthropicFormat(mcpTools.tools);
+        let finished = false;
+        let recursion = 0;
+        const MAX_RECURSION = 5;
+        let apiResponseObject: any;
+        
+        const toolCallTracker = new Set<string>(); 
+        
+        try {
+          while (!finished && recursion < MAX_RECURSION) {
+            console.error(`[LOG][ANTHROPIC] Chamada para Claude API (iteração ${recursion + 1}/${MAX_RECURSION})`);
+            
+            apiResponseObject = await callClaudeDirectAPI(
+              currentTurnMessages,
+              anthropicTools,
+              clientId,
+              systemPrompt as string | undefined
+            );
+            
+            const assistantResponseContent: CustomContentBlock[] = (apiResponseObject.content || [])
+              .map((block: any): CustomContentBlock | null => {
+                if (block.type === 'text') return { type: 'text', text: block.text } as CustomContentBlock;
+                if (block.type === 'tool_use') return { type: 'tool_use', id: block.id, name: block.name, input: block.input } as CustomContentBlock;
+                return null;
+              })
+              .filter((block: any): block is CustomContentBlock => block !== null);
+
+            if (assistantResponseContent.length > 0) {
+              currentTurnMessages.push({
+                role: 'assistant',
+                content: assistantResponseContent,
+              });
+            } else if (apiResponseObject.stop_reason === 'end_turn' && !apiResponseObject.content?.some((b:any) => b.type === 'text')) {
+              currentTurnMessages.push({role: 'assistant', content: [{type: 'text', text: ""}] });
+            }
+
+            if (apiResponseObject.stop_reason === 'tool_use') {
+              finished = false;
+              const toolUseBlocks = assistantResponseContent.filter(block => block.type === 'tool_use');
+              
+              if (!toolUseBlocks || toolUseBlocks.length === 0) {
+                console.error("[LOG][ANTHROPIC] Stop reason is tool_use, but no tool_use blocks found in content. Breaking.");
+                finished = true;
+                break;
+              }
+
+              const toolResultsForThisTurn: CustomContentBlock[] = [];
+
+              for (const toolUseBlock of toolUseBlocks) {
+                if (!toolUseBlock.id || !toolUseBlock.name) {
+                   console.error("[LOG][ANTHROPIC] Invalid tool_use block received:", toolUseBlock);
+                   toolResultsForThisTurn.push({
+                      type: 'tool_result',
+                      tool_use_id: toolUseBlock.id || `error_unknown_tool_id_${uuidv4()}`,
+                      content: "Error: Tool use block was malformed."
+                   });
+                   continue;
+                }
+
+                const toolCallSignature = `${toolUseBlock.name}_${JSON.stringify(toolUseBlock.input || {})}`;
+                if (toolCallTracker.has(toolCallSignature)) {
+                  console.warn(`[LOG][ANTHROPIC] Duplicate tool call detected and blocked: ${toolUseBlock.name}`);
+                  toolResultsForThisTurn.push({
+                    type: 'tool_result',
+                    tool_use_id: toolUseBlock.id,
+                    content: `Error: Tool ${toolUseBlock.name} was called again with the exact same parameters in this turn. This indicates a potential loop.`
+                  });
+                  continue; 
+                }
+                toolCallTracker.add(toolCallSignature);
+
+                console.error(`[LOG][ANTHROPIC] Processando chamada de ferramenta: ${toolUseBlock.name}`);
+                try {
+                  let executionResult;
+                  if (toolUseBlock.name.startsWith('getJira') || toolUseBlock.name === 'getDetailedJiraIssue') {
+                    executionResult = await mcpClient.callTool({ name: toolUseBlock.name, arguments: { ...toolUseBlock.input, sessionId: session.sessionId } });
+                    console.error('[DEBUG][TOOL_CALL][ANTHROPIC] Propagando sessionId para tool Jira:', toolUseBlock.name, session.sessionId);
+                  } else {
+                    executionResult = await mcpClient.callTool({ name: toolUseBlock.name, arguments: toolUseBlock.input });
+                  }
+                  let resultStringContent: string;
+
+                  if (executionResult && executionResult.content && Array.isArray(executionResult.content) && executionResult.content.length > 0) {
+                    resultStringContent = executionResult.content[0].text || JSON.stringify(executionResult.content[0]);
+                  } else if (typeof executionResult.content === 'string') {
+                    resultStringContent = executionResult.content;
+                  } else {
+                    resultStringContent = JSON.stringify(executionResult);
+                  }
+                  
+                  toolResultsForThisTurn.push({
+                    type: 'tool_result',
+                    tool_use_id: toolUseBlock.id,
+                    content: resultStringContent
+                  });
+                } catch (toolExecError: any) {
+                  console.error(`[ERROR][ANTHROPIC] Erro ao executar ferramenta ${toolUseBlock.name}:`, toolExecError);
+                  toolResultsForThisTurn.push({
+                    type: 'tool_result',
+                    tool_use_id: toolUseBlock.id,
+                    content: `Error executing tool ${toolUseBlock.name}: ${toolExecError.message}`
+                  });
+                }
+              }
+
+              if (toolResultsForThisTurn.length > 0) {
+                currentTurnMessages.push({
+                  role: 'user',
+                  content: toolResultsForThisTurn,
+                });
+              }
+              if (toolResultsForThisTurn.every(tr => (tr as any).is_error && toolCallTracker.has(`${(toolUseBlocks.find(tu => tu.id === tr.tool_use_id) || {}).name}_${JSON.stringify((toolUseBlocks.find(tu => tu.id === tr.tool_use_id) || {}).input || {})}`))) {
+                  console.warn("[LOG][ANTHROPIC] All tool calls in this step were duplicate errors. Breaking to prevent loop.");
+                  finished = true;
+              }
+
+            } else {
+              finished = true;
+              console.error(`[LOG][ANTHROPIC] Processamento concluído por Claude, motivo: ${apiResponseObject.stop_reason}`);
+            }
+            recursion++;
+          }
+
+          if (recursion >= MAX_RECURSION) {
+            console.warn("[LOG][ANTHROPIC] Max recursion depth reached for tool processing.");
+          }
+
+          let finalResponseText = '';
+          const lastAssistantMsg = currentTurnMessages.filter(m => m.role === 'assistant').pop();
+          if (lastAssistantMsg && Array.isArray(lastAssistantMsg.content)) {
+            finalResponseText = lastAssistantMsg.content
+              .filter((c: CustomContentBlock) => c.type === 'text' && c.text)
+              .map((c: CustomContentBlock) => c.text)
+              .join('\n');
+          } else if (lastAssistantMsg && typeof lastAssistantMsg.content === 'string') {
+              finalResponseText = lastAssistantMsg.content;
+          }
+          
+          if (!finalResponseText && apiResponseObject && apiResponseObject.stop_reason !== 'end_turn') {
+              finalResponseText = "[O assistente terminou de usar ferramentas, mas não forneceu uma mensagem de texto final.]";
+          }
+
+          console.error('[LOG][CHAT] Final response to frontend:', { text: finalResponseText, historyLength: currentTurnMessages.length });
+          res.json({ 
+            response: finalResponseText,
+            history: currentTurnMessages
+          });
+          return;
+
+        } catch (err: any) {
+          console.error('[ERROR][ANTHROPIC_CHAT_HANDLER]', err);
+          if (err.status === 400 && err.error?.error?.message?.includes("unexpected `tool_use_id`")) {
+               console.error('[LOG][ANTHROPIC] Detectado erro de estrutura (400) na API Anthropic. O histórico pode estar malformado.');
+          }
+          res.status(err.status || 500).json({ error: `Erro ao processar mensagem com Anthropic (Direto): ${err.message}` });
+          return;
+        }
+      } else {
+        console.error('[Server] Modelo não suportado:', selectedModel);
+        res.status(400).json({ error: 'Modelo não suportado.' });
+        return;
+      }
+    } catch (err: any) {
+      console.error('[Server] Unhandled error in /chat:', err);
+      res.status(500).json({ error: err.message });
+      return;
+    }
+  });
 });
 
 // Add new endpoint for dynamic tool discovery
@@ -666,122 +1316,6 @@ app.get('/prompts/:name', async (req, res) => {
     res.status(500).json({ error: 'Erro ao obter prompt.' });
   }
 });
-
-// Create a helper function to get credentials from context
-function getCredentialsFromContext(context: any): any {
-  const conversationId = context?._meta?.conversationId as string;
-  let credentials = sessionCredentialsMap.get(context?.sessionId as string);
-  
-  // If no credentials from sessionId, try from conversationId
-  if (!credentials && conversationId) {
-    credentials = sessionCredentialsMap.get(conversationId);
-    if (credentials) {
-      console.log(`[JIRA-TOOL] Found credentials via conversationId: ${conversationId}`);
-    }
-  }
-  
-  return credentials;
-}
-
-// Registro das ferramentas do Jira deve aceitar o parâmetro extra/contexto normalmente
-server.tool(getJiraIssueTool.name, { issueKey: z.string().describe("The Jira issue key or ID (e.g., 'PROJ-123')") }, async (args, context) => {
-  // Try to get credentials from the session map using the sessionId or from metadata
-  const credentials = getCredentialsFromContext(context);
-  return getJiraIssueExecutor({
-    ...args,
-    _jiraCredentials: credentials
-  });
-});
-
-server.tool(getDetailedJiraIssueTool.name, {
-  issueKey: z.string().describe("The key of the Jira issue (e.g., 'PROJ-123')"),
-  fields: z.string().optional().describe("Comma-separated list of fields to return"),
-  expand: z.string().optional().describe("Comma-separated list of entities to expand")
-}, async (args, context) => {
-  const credentials = getCredentialsFromContext(context);
-  return getDetailedJiraIssueExecutor({
-    ...args,
-    _jiraCredentials: credentials
-  });
-});
-
-server.tool(getJiraIssueCommentsTool.name, {
-  issueKey: z.string().describe("The key of the Jira issue (e.g., 'PROJ-123')")
-}, async (args, context) => {
-  const credentials = getCredentialsFromContext(context);
-  return getJiraIssueCommentsExecutor({
-    ...args,
-    _jiraCredentials: credentials
-  });
-});
-
-server.tool(getJiraIssueTransitionsTool.name, {
-  issueKey: z.string().describe("The key of the Jira issue (e.g., 'PROJ-123')"),
-  expand: z.string().optional().describe("Expand operations for the returned transitions")
-}, async (args, context) => {
-  const credentials = getCredentialsFromContext(context);
-  return getJiraIssueTransitionsExecutor({
-    ...args,
-    _jiraCredentials: credentials
-  });
-});
-
-server.tool(searchJiraIssuesTool.name, {
-  jql: z.string().describe("JQL search query (e.g., 'assignee = currentUser() AND status = In Progress')"),
-  startAt: z.number().optional().describe("The index of the first item to return"),
-  maxResults: z.number().optional().describe("The maximum number of items to return"),
-  fields: z.string().optional().describe("Comma-separated list of fields to return"),
-  expand: z.string().optional().describe("Comma-separated list of entities to expand")
-}, async (args, context) => {
-  const credentials = getCredentialsFromContext(context);
-  return searchJiraIssuesExecutor({
-    ...args,
-    _jiraCredentials: credentials
-  });
-});
-
-server.tool(getJiraIssueWatchersTool.name, {
-  issueKey: z.string().describe("The key of the Jira issue (e.g., 'PROJ-123')")
-}, async (args, context) => {
-  const credentials = getCredentialsFromContext(context);
-  return getJiraIssueWatchersExecutor({
-    ...args,
-    _jiraCredentials: credentials
-  });
-});
-
-server.tool(getJiraIssueAttachmentsTool.name, {
-  issueKey: z.string().describe("The key of the Jira issue (e.g., 'PROJ-123')")
-}, async (args, context) => {
-  const credentials = getCredentialsFromContext(context);
-  return getJiraIssueAttachmentsExecutor({
-    ...args,
-    _jiraCredentials: credentials
-  });
-});
-
-server.tool(getJiraIssueSprintsTool.name, {
-  issueKey: z.string().describe("The key of the Jira issue (e.g., 'PROJ-123')")
-}, async (args, context) => {
-  const credentials = getCredentialsFromContext(context);
-  return getJiraIssueSprintsExecutor({
-    ...args,
-    _jiraCredentials: credentials
-  });
-});
-
-if (addJiraCommentTool && addJiraCommentExecutor) {
-  server.tool(addJiraCommentTool.name, {
-    issueKey: z.string().describe("The key of the issue to comment on."),
-    body: z.string().describe("The comment text.")
-  }, async (args, context) => {
-    const credentials = getCredentialsFromContext(context);
-    return addJiraCommentExecutor({
-      ...args,
-      _jiraCredentials: credentials
-    });
-  });
-}
 
 const port = 3333;
 app.listen(port, () => {
